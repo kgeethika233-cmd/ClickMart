@@ -42,3 +42,4 @@ export const config = {
   ...parsed.data,
   corsOriginsList: parsed.data.CORS_ORIGINS.split(',').map((s) => s.trim()),
 };
+

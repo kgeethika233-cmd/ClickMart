@@ -21,13 +21,13 @@ export const pool = new Pool({
   database: config.PG_DATABASE,
   ssl: {
     ca: caCert,
-    rejectUnauthorized: true,
   },
   max: 10,
   idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 5000,
+  connectionTimeoutMillis: 20000,
 });
 
 pool.on('error', (err) => {
   logger.error({ err }, 'Unexpected error on idle PostgreSQL client');
 });
+

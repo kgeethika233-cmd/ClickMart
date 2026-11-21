@@ -2,10 +2,11 @@ import { randomUUID } from 'crypto';
 import { pool } from '../db.js';
 
 const BASE_URL = process.argv[2] || 'http://localhost:4000';
+const CONCURRENCY = 50;
 
 async function run() {
   console.log('\n======================================================');
-  console.log('⚡ Concurrency Proof: 20 simultaneous requests on 1 unit');
+  console.log(`⚡ Concurrency Proof: ${CONCURRENCY} simultaneous requests on 1 unit`);
   console.log('======================================================\n');
 
   // 1. Reset LAST-ITEM-TEST to stock 1
@@ -28,15 +29,15 @@ async function run() {
     client.release();
   }
 
-  // 2. Fire 20 simultaneous POST requests
-  const requests = Array.from({ length: 20 }, (_, i) => {
+  // 2. Fire 50 simultaneous POST requests
+  const requests = Array.from({ length: CONCURRENCY }, (_, i) => {
     return fetch(`${BASE_URL}/api/orders`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         customerEmail: `buyer_${i + 1}@example.com`,
         customerName: `Buyer ${i + 1}`,
-        idempotencyKey: randomUUID(),
+        idempotencyKey: `idem-${randomUUID()}`,
         items: [{ productId, quantity: 1 }],
       }),
     })
@@ -57,11 +58,12 @@ async function run() {
   console.log(`  - 201 Created (Success):       ${count201}`);
   console.log(`  - 409 Conflict (Out of stock): ${count409}`);
   if (countOther > 0) {
-    console.log(`  - Other errors:                ${countOther}`);
+    console.log(`  - Other responses:             ${countOther}`);
+    results.filter(r => r.status !== 201 && r.status !== 409).slice(0, 5).forEach(r => console.log('Sample unexpected:', r));
   }
 
-  if (count201 === 1 && count409 === 19) {
-    console.log('\n✅ PASSED: Exactly 1 order succeeded and 19 were safely rejected with 409 Conflict!');
+  if (count201 === 1 && count409 === 49) {
+    console.log(`\n✅ PASSED: Exactly 1 order succeeded and 49 were safely rejected with 409 Conflict!`);
   } else {
     console.error(`\n❌ FAILED: Concurrency invariant violated (201s: ${count201}, 409s: ${count409})`);
     process.exit(1);

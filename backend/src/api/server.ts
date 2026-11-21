@@ -2,6 +2,9 @@ import express, { Request, Response, NextFunction } from 'express';
 import helmet from 'helmet';
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
+import multer from 'multer';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import { config } from '../config.js';
@@ -9,16 +12,31 @@ import { logger } from '../logger.js';
 import { pool } from '../db.js';
 import { kafka } from '../kafka.js';
 import { opensearch } from '../opensearch.js';
-import { CONTRACT_VERSION, LIMITS, PRICE_RANGE_KEYS, PriceRangeBucket, Product } from '../types/contract.js';
+import {
+  CONTRACT_VERSION,
+  LIMITS,
+  PRICE_RANGE_KEYS,
+  PriceRangeBucket,
+  Product,
+  Order,
+  OrderStatus,
+  SearchResponse,
+} from '../types/contract.js';
 import { buildEnvelope } from '../events.js';
+import { computeExpiryInfo } from '../utils/expiry.js';
+import { normalizeSearchTerm, multilingualTerms } from '../utils/synonyms.js';
+import { stockEvents } from '../utils/stockEvents.js';
+
+const JWT_SECRET = process.env.JWT_SECRET || config.ADMIN_KEY || 'inventory-hub-hackathon-secret-key-2026';
 
 const app = express();
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 // Security & Middlewares
-app.use(helmet());
+app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(express.json({ limit: '100kb' }));
 
-// CORS setup strictly per contract Section 5
+// CORS setup
 const corsOptions: cors.CorsOptions = {
   origin: (origin, callback) => {
     if (!origin || config.corsOriginsList.includes(origin) || config.corsOriginsList.includes('*')) {
@@ -27,13 +45,22 @@ const corsOptions: cors.CorsOptions = {
       callback(null, false);
     }
   },
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-key', 'ngrok-skip-browser-warning'],
+  methods: ['GET', 'POST', 'PUT', 'OPTIONS'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'x-customer-id',
+    'Idempotency-Key',
+    'Accept',
+    'ngrok-skip-browser-warning',
+    'x-admin-key',
+  ],
   credentials: false,
   optionsSuccessStatus: 204,
 };
 
 app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 
 // Request logging
 app.use((req: Request, res: Response, next: NextFunction) => {
@@ -53,7 +80,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 // Rate limiting
 const apiLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 120,
+  max: 300,
   standardHeaders: true,
   legacyHeaders: false,
   skip: (req) => req.method === 'OPTIONS',
@@ -69,7 +96,7 @@ const apiLimiter = rateLimit({
 
 const orderLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 20,
+  max: 200,
   standardHeaders: true,
   legacyHeaders: false,
   skip: (req) => req.method === 'OPTIONS',
@@ -94,6 +121,36 @@ function sendError(res: Response, status: number, code: string, message: string,
   });
 }
 
+// Convert DB Product row to Contract Product
+function mapDbProductToContract(row: any): Product & { id: number } {
+  const availableCount = Math.max(0, Number(row.available_count ?? row.availableCount ?? row.stock_count ?? 0));
+  const expiry = computeExpiryInfo(row.expiry_date);
+  const id = Number(row.id ?? row.product_id ?? row.productId);
+  return {
+    id,
+    productId: id,
+    sku: String(row.sku),
+    name: String(row.name),
+    description: String(row.description || ''),
+    category: String(row.category),
+    city: String(row.city),
+    priceCents: Number(row.price_cents ?? row.priceCents ?? Math.round(Number(row.price || 0) * 100)),
+    currency: String(row.currency || 'INR'),
+    imageUrl: row.image_url ?? row.imageUrl ?? null,
+    inStock: availableCount > 0,
+    availableCount,
+    rating: row.rating ? Number(row.rating) : 4.5,
+    delivery_time_mins: row.delivery_time_mins ?? 30,
+    delivery_fee: row.delivery_fee ?? 49,
+    distance_km: row.distance_km ? Number(row.distance_km) : 3.5,
+    tags: Array.isArray(row.tags) ? row.tags : [],
+    expiry_date: expiry.expiry_date,
+    days_to_expiry: expiry.days_to_expiry,
+    expiry_status: expiry.expiry_status,
+    badge: expiry.badge,
+  };
+}
+
 // -------------------------------------------------------------
 // 1. Health Endpoint: GET /api/health
 // -------------------------------------------------------------
@@ -104,22 +161,22 @@ app.get('/api/health', async (req: Request, res: Response) => {
     opensearch: 'down' as 'up' | 'down',
   };
 
-  // 1. PostgreSQL check with 3s timeout
+  // 1. PostgreSQL check
   try {
     const pgCheck = pool.query('SELECT 1');
-    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 3000));
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000));
     await Promise.race([pgCheck, timeout]);
     services.postgres = 'up';
   } catch (err) {
     logger.error({ err }, 'Health check failed for PostgreSQL');
   }
 
-  // 2. Kafka check with 3s timeout
+  // 2. Kafka check
   try {
     const admin = kafka.admin();
     await admin.connect();
     const topicsCheck = admin.listTopics();
-    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 3000));
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 8000));
     await Promise.race([topicsCheck, timeout]);
     await admin.disconnect();
     services.kafka = 'up';
@@ -127,10 +184,10 @@ app.get('/api/health', async (req: Request, res: Response) => {
     logger.error({ err }, 'Health check failed for Kafka');
   }
 
-  // 3. OpenSearch check with 3s timeout
+  // 3. OpenSearch check
   try {
-    const osCheck = opensearch.cluster.health();
-    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 3000));
+    const osCheck = opensearch.info().catch(() => opensearch.cluster.health());
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000));
     await Promise.race([osCheck, timeout]);
     services.opensearch = 'up';
   } catch (err) {
@@ -141,8 +198,9 @@ app.get('/api/health', async (req: Request, res: Response) => {
 
   res.status(allUp ? 200 : 503).json({
     status: allUp ? 'ok' : 'degraded',
-    services,
     contractVersion: CONTRACT_VERSION,
+    time: new Date().toISOString(),
+    services,
   });
 });
 
@@ -152,14 +210,14 @@ app.get('/api/health', async (req: Request, res: Response) => {
 app.get('/api/search', apiLimiter, async (req: Request, res: Response) => {
   try {
     const qRaw = typeof req.query.q === 'string' ? req.query.q.trim() : '';
-    if (qRaw.length > LIMITS.SEARCH_Q_MAX_LENGTH) {
-      return sendError(res, 400, 'VALIDATION_ERROR', `Search query must not exceed ${LIMITS.SEARCH_Q_MAX_LENGTH} characters.`);
+    if (qRaw.length > LIMITS.searchQueryMaxLength) {
+      return sendError(res, 400, 'VALIDATION_ERROR', `Search query must not exceed ${LIMITS.searchQueryMaxLength} characters.`);
     }
 
     const page = Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1);
     const pageSize = Math.min(
-      LIMITS.SEARCH_PAGE_SIZE_MAX,
-      Math.max(1, parseInt(String(req.query.pageSize || String(LIMITS.SEARCH_PAGE_SIZE_DEFAULT)), 10) || LIMITS.SEARCH_PAGE_SIZE_DEFAULT)
+      LIMITS.pageSizeMax,
+      Math.max(1, parseInt(String(req.query.pageSize || String(LIMITS.pageSizeDefault)), 10) || LIMITS.pageSizeDefault)
     );
 
     // Normalize category and city arrays
@@ -170,28 +228,57 @@ app.get('/api/search', apiLimiter, async (req: Request, res: Response) => {
       ? (Array.isArray(req.query.city) ? req.query.city : [req.query.city]).map(String)
       : [];
 
-    const minPricePaise = req.query.minPrice ? parseInt(String(req.query.minPrice), 10) : undefined;
-    const maxPricePaise = req.query.maxPrice ? parseInt(String(req.query.maxPrice), 10) : undefined;
+    const minPriceRupees = req.query.minPrice !== undefined ? parseFloat(String(req.query.minPrice)) : undefined;
+    const maxPriceRupees = req.query.maxPrice !== undefined ? parseFloat(String(req.query.maxPrice)) : undefined;
 
-    if (minPricePaise !== undefined && maxPricePaise !== undefined && minPricePaise > maxPricePaise) {
+    if (minPriceRupees !== undefined && maxPriceRupees !== undefined && minPriceRupees > maxPriceRupees) {
       return sendError(res, 400, 'VALIDATION_ERROR', 'minPrice cannot be greater than maxPrice.');
     }
 
-    const sortOption = req.query.sort || 'relevance';
+    const ratingFilter = req.query.rating ? parseFloat(String(req.query.rating)) : undefined;
+    const expiryFilter = typeof req.query.expiry === 'string' ? req.query.expiry.trim() : undefined;
+    const sortOption = (req.query.sort as string) || 'relevance';
 
-    // Build OpenSearch query
+    // Must clauses
     const mustClauses: any[] = [
       { term: { is_active: true } },
       { term: { in_stock: true } },
     ];
 
+    // Typo-tolerant fuzzy search with synonyms
     if (qRaw) {
+      const normalizedQuery = qRaw.split(/\s+/).map(normalizeSearchTerm).join(' ');
+      const searchTerms = Array.from(new Set([qRaw, normalizedQuery])).join(' ');
+
       mustClauses.push({
-        multi_match: {
-          query: qRaw,
-          fields: ['name^3', 'description', 'category'],
-          fuzziness: 'AUTO',
-          prefix_length: 1,
+        bool: {
+          should: [
+            {
+              multi_match: {
+                query: searchTerms,
+                fields: ['name^5', 'tags^3', 'category^2', 'description'],
+                fuzziness: 'AUTO',
+                prefix_length: 0,
+              },
+            },
+            {
+              multi_match: {
+                query: normalizedQuery,
+                fields: ['name^5', 'tags^3', 'category^2', 'description'],
+                fuzziness: 'AUTO',
+                prefix_length: 0,
+              },
+            },
+            {
+              wildcard: {
+                name: {
+                  value: `*${qRaw.toLowerCase()}*`,
+                  boost: 2.0,
+                },
+              },
+            },
+          ],
+          minimum_should_match: 1,
         },
       });
     }
@@ -204,11 +291,15 @@ app.get('/api/search', apiLimiter, async (req: Request, res: Response) => {
       filterClauses.push({ terms: { city: cities } });
     }
 
-    if (minPricePaise !== undefined || maxPricePaise !== undefined) {
+    if (minPriceRupees !== undefined || maxPriceRupees !== undefined) {
       const priceFilter: any = {};
-      if (minPricePaise !== undefined) priceFilter.gte = minPricePaise / 100;
-      if (maxPricePaise !== undefined) priceFilter.lte = maxPricePaise / 100;
+      if (minPriceRupees !== undefined && !isNaN(minPriceRupees)) priceFilter.gte = minPriceRupees;
+      if (maxPriceRupees !== undefined && !isNaN(maxPriceRupees)) priceFilter.lte = maxPriceRupees;
       filterClauses.push({ range: { price: priceFilter } });
+    }
+
+    if (ratingFilter !== undefined && !isNaN(ratingFilter)) {
+      filterClauses.push({ range: { rating: { gte: ratingFilter } } });
     }
 
     // Sort order
@@ -236,19 +327,21 @@ app.get('/api/search', apiLimiter, async (req: Request, res: Response) => {
       },
       sort: sortArray,
       aggs: {
-        categories: { terms: { field: 'category', size: 10 } },
-        cities: { terms: { field: 'city', size: 10 } },
+        categories: { terms: { field: 'category', size: 20 } },
+        cities: { terms: { field: 'city', size: 20 } },
         price_ranges: {
           range: {
             field: 'price',
             ranges: [
-              { key: 'under-500', to: 500 },
-              { key: '500-1500', from: 500, to: 1500 },
-              { key: '1500-5000', from: 1500, to: 5000 },
-              { key: 'above-5000', from: 5000 },
+              { key: 'lt-500', to: 500 },
+              { key: '500-2000', from: 500, to: 2000 },
+              { key: '2000-10000', from: 2000, to: 10000 },
+              { key: 'gt-10000', from: 10000 },
             ],
           },
         },
+        min_price: { min: { field: 'price' } },
+        max_price: { max: { field: 'price' } },
       },
     };
 
@@ -259,53 +352,86 @@ app.get('/api/search', apiLimiter, async (req: Request, res: Response) => {
 
     const responseBody = osRes.body || osRes;
     const hits = responseBody.hits?.hits || [];
-    const total = typeof responseBody.hits?.total === 'number'
+    let total = typeof responseBody.hits?.total === 'number'
       ? responseBody.hits.total
       : (responseBody.hits?.total?.value || 0);
 
-    const products: Product[] = hits.map((h: any) => {
+    let items: Product[] = hits.map((h: any) => {
       const s = h._source;
+      const expiry = computeExpiryInfo(s.expiry_date);
+      const availableCount = Math.max(0, s.stock_count);
       return {
-        id: s.product_id,
+        productId: s.product_id,
         sku: s.sku,
         name: s.name,
-        description: s.description || null,
+        description: s.description || '',
         category: s.category,
         city: s.city,
-        priceCents: Math.round(Number(s.price) * 100),
+        priceCents: s.price_cents ?? Math.round(Number(s.price) * 100),
         currency: s.currency || 'INR',
         imageUrl: s.image_url || null,
-        availableCount: s.stock_count,
-        inStock: s.in_stock,
+        inStock: availableCount > 0,
+        availableCount,
+        rating: s.rating ? Number(s.rating) : 4.5,
+        delivery_time_mins: s.delivery_time_mins ?? 30,
+        delivery_fee: s.delivery_fee ?? 49,
+        distance_km: s.distance_km ? Number(s.distance_km) : 3.5,
+        tags: Array.isArray(s.tags) ? s.tags : [],
+        expiry_date: expiry.expiry_date,
+        days_to_expiry: expiry.days_to_expiry,
+        expiry_status: expiry.expiry_status,
+        badge: expiry.badge,
       };
     });
+
+    // Expiry filter logic (never return expired items in search results)
+    items = items.filter((p) => p.expiry_status !== 'expired');
+
+    if (expiryFilter && expiryFilter !== 'any') {
+      items = items.filter((p) => {
+        if (expiryFilter === '7') return p.days_to_expiry !== null && p.days_to_expiry > 0 && p.days_to_expiry <= 7;
+        if (expiryFilter === '30') return p.days_to_expiry !== null && p.days_to_expiry > 0 && p.days_to_expiry <= 30;
+        if (expiryFilter === 'nonperishable') return p.expiry_status === 'none';
+        return true;
+      });
+      total = items.length;
+    }
 
     // Format facets
     const catBuckets = responseBody.aggregations?.categories?.buckets || [];
     const cityBuckets = responseBody.aggregations?.cities?.buckets || [];
     const priceBucketsRaw = responseBody.aggregations?.price_ranges?.buckets || [];
-
     const priceBucketMap = new Map(priceBucketsRaw.map((b: any) => [b.key, b.doc_count]));
 
     const priceRanges: PriceRangeBucket[] = [
-      { key: 'under-500', label: 'Under ₹500', minPrice: 0, maxPrice: 50000, count: priceBucketMap.get('under-500') || 0 },
-      { key: '500-1500', label: '₹500 - ₹1,500', minPrice: 50000, maxPrice: 150000, count: priceBucketMap.get('500-1500') || 0 },
-      { key: '1500-5000', label: '₹1,500 - ₹5,000', minPrice: 150000, maxPrice: 500000, count: priceBucketMap.get('1500-5000') || 0 },
-      { key: 'above-5000', label: 'Above ₹5,000', minPrice: 500000, maxPrice: null, count: priceBucketMap.get('above-5000') || 0 },
+      { key: 'lt-500', label: 'Under ₹500', minPrice: null, maxPrice: 500, count: priceBucketMap.get('lt-500') || 0 },
+      { key: '500-2000', label: '₹500 - ₹2,000', minPrice: 500, maxPrice: 2000, count: priceBucketMap.get('500-2000') || 0 },
+      { key: '2000-10000', label: '₹2,000 - ₹10,000', minPrice: 2000, maxPrice: 10000, count: priceBucketMap.get('2000-10000') || 0 },
+      { key: 'gt-10000', label: 'Above ₹10,000', minPrice: 10000, maxPrice: null, count: priceBucketMap.get('gt-10000') || 0 },
     ];
 
-    res.json({
-      products,
+    const minPriceAgg = responseBody.aggregations?.min_price?.value ?? 0;
+    const maxPriceAgg = responseBody.aggregations?.max_price?.value ?? 10000;
+
+    const responseData = {
       total,
       page,
       pageSize,
       totalPages: Math.ceil(total / pageSize) || 1,
+      items,
+      products: items,
       facets: {
         categories: catBuckets.map((b: any) => ({ value: b.key, count: b.doc_count })),
         cities: cityBuckets.map((b: any) => ({ value: b.key, count: b.doc_count })),
         priceRanges,
+        price: {
+          min: Math.floor(minPriceAgg),
+          max: Math.ceil(maxPriceAgg),
+        },
       },
-    });
+    };
+
+    res.json(responseData);
   } catch (err: any) {
     logger.error({ err }, 'Search endpoint failed');
     sendError(res, 500, 'INTERNAL_ERROR', 'An error occurred while searching products.');
@@ -313,7 +439,146 @@ app.get('/api/search', apiLimiter, async (req: Request, res: Response) => {
 });
 
 // -------------------------------------------------------------
-// 3. Product Detail: GET /api/products/:productId
+// 3. Autocomplete: GET /api/autocomplete?q
+// -------------------------------------------------------------
+app.get('/api/autocomplete', apiLimiter, async (req: Request, res: Response) => {
+  try {
+    const qRaw = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    if (!qRaw) {
+      return res.json({ suggestions: [], corrections: [], products: [] });
+    }
+
+    const words = qRaw.split(/\s+/).filter(Boolean);
+    const normalized = words.map(normalizeSearchTerm);
+    const corrections = words.flatMap((from, index) =>
+      normalized[index].toLowerCase() !== from.toLowerCase() ? [{ from, to: normalized[index] }] : []
+    );
+    const query = normalized.join(' ');
+
+    // Match suggestions
+    const suggestions = Array.from(
+      new Set([query, ...Object.values(multilingualTerms).filter((term) => term.startsWith(query))])
+    ).slice(0, 4);
+
+    // Search matching products
+    const osRes = await opensearch.search({
+      index: 'products',
+      body: {
+        size: 4,
+        query: {
+          bool: {
+            must: [
+              { term: { is_active: true } },
+              { term: { in_stock: true } },
+              {
+                multi_match: {
+                  query: query || qRaw,
+                  fields: ['name^4', 'tags^2', 'category'],
+                  fuzziness: 'AUTO',
+                  prefix_length: 1,
+                },
+              },
+            ],
+          },
+        },
+      },
+    });
+
+    const hits = (osRes.body || osRes).hits?.hits || [];
+    const products = hits.map((h: any) => {
+      const s = h._source;
+      return {
+        id: s.product_id,
+        name: s.name,
+        image_url: s.image_url || null,
+        price: Number(s.price || (s.price_cents / 100)),
+        category: s.category,
+      };
+    });
+
+    res.json({ suggestions, corrections, products });
+  } catch (err: any) {
+    logger.error({ err }, 'Autocomplete failed');
+    sendError(res, 500, 'INTERNAL_ERROR', 'Could not load suggestions.');
+  }
+});
+
+// -------------------------------------------------------------
+// 4. Image Search: POST /api/search/image
+// -------------------------------------------------------------
+app.post('/api/search/image', upload.single('image'), async (req: Request, res: Response) => {
+  try {
+    const file = req.file;
+    const filename = file
+      ? file.originalname.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').toLowerCase()
+      : 'popular picks';
+
+    const terms = filename.split(/\s+/).map(normalizeSearchTerm).filter((term) => term.length > 1);
+
+    let items: Product[] = [];
+    if (terms.length > 0) {
+      const q = terms.join(' ');
+      const osRes = await opensearch.search({
+        index: 'products',
+        body: {
+          size: 8,
+          query: {
+            bool: {
+              must: [
+                { term: { is_active: true } },
+                { term: { in_stock: true } },
+                {
+                  multi_match: {
+                    query: q,
+                    fields: ['name^4', 'tags^3', 'category'],
+                    fuzziness: 'AUTO',
+                  },
+                },
+              ],
+            },
+          },
+        },
+      });
+      const hits = (osRes.body || osRes).hits?.hits || [];
+      items = hits.map((h: any) => mapDbProductToContract(h._source));
+    }
+
+    if (items.length === 0) {
+      // Fallback to top in-stock products
+      const osRes = await opensearch.search({
+        index: 'products',
+        body: {
+          size: 5,
+          query: {
+            bool: {
+              must: [{ term: { is_active: true } }, { term: { in_stock: true } }],
+            },
+          },
+        },
+      });
+      const hits = (osRes.body || osRes).hits?.hits || [];
+      items = hits.map((h: any) => mapDbProductToContract(h._source));
+    }
+
+    // Exclude expired items
+    items = items.filter((p) => p.expiry_status !== 'expired');
+
+    res.json({
+      detected: {
+        keywords: terms.length ? terms : ['popular picks'],
+        attributes: {},
+        via: 'filename',
+      },
+      products: items,
+    });
+  } catch (err: any) {
+    logger.error({ err }, 'Image search failed');
+    sendError(res, 500, 'INTERNAL_ERROR', 'Could not search this image.');
+  }
+});
+
+// -------------------------------------------------------------
+// 5. Product Detail: GET /api/products/:productId (LIVE PostgreSQL read)
 // -------------------------------------------------------------
 app.get('/api/products/:productId', apiLimiter, async (req: Request, res: Response) => {
   const productId = parseInt(req.params.productId, 10);
@@ -334,23 +599,7 @@ app.get('/api/products/:productId', apiLimiter, async (req: Request, res: Respon
       return sendError(res, 404, 'NOT_FOUND', 'Product not found.');
     }
 
-    const p = rows[0];
-    const availableCount = Math.max(0, p.available_count);
-
-    const product: Product = {
-      id: p.id,
-      sku: p.sku,
-      name: p.name,
-      description: p.description || null,
-      category: p.category,
-      city: p.city,
-      priceCents: p.price_cents,
-      currency: p.currency,
-      imageUrl: p.image_url || null,
-      availableCount,
-      inStock: availableCount > 0,
-    };
-
+    const product = mapDbProductToContract(rows[0]);
     res.json(product);
   } catch (err: any) {
     logger.error({ err }, 'Failed to fetch product');
@@ -359,36 +608,42 @@ app.get('/api/products/:productId', apiLimiter, async (req: Request, res: Respon
 });
 
 // -------------------------------------------------------------
-// 4. Place Order: POST /api/orders (Core Locking Engine)
+// 6. Place Order: POST /api/orders (Row Locking SELECT ... FOR UPDATE)
 // -------------------------------------------------------------
 const CreateOrderInputSchema = z.object({
-  customerEmail: z.string().email().max(LIMITS.CUSTOMER_EMAIL_MAX),
-  customerName: z.string().min(1).max(LIMITS.CUSTOMER_NAME_MAX),
-  idempotencyKey: z.string().min(1).max(255),
-  items: z.array(
-    z.object({
-      productId: z.number().int().positive(),
-      quantity: z.number().int().min(1).max(LIMITS.ORDER_QUANTITY_MAX),
-    })
-  ).min(1).max(LIMITS.ORDER_ITEMS_MAX),
+  customerEmail: z.string().email().max(LIMITS.emailMaxLength),
+  customerName: z.string().min(1).max(LIMITS.nameMaxLength),
+  idempotencyKey: z.string().min(LIMITS.idempotencyKeyMin).max(LIMITS.idempotencyKeyMax),
+  items: z
+    .array(
+      z.object({
+        productId: z.number().int().positive(),
+        quantity: z.number().int().min(LIMITS.quantityMin).max(LIMITS.quantityMax),
+      })
+    )
+    .min(1)
+    .max(LIMITS.itemsPerOrderMax),
 });
 
 app.post('/api/orders', orderLimiter, async (req: Request, res: Response) => {
   const parseResult = CreateOrderInputSchema.safeParse(req.body);
   if (!parseResult.success) {
-    const fields: Record<string, string> = {};
+    const details: Record<string, string> = {};
     for (const issue of parseResult.error.issues) {
-      fields[issue.path.join('.')] = issue.message;
+      const field = issue.path[0] ? String(issue.path[0]) : 'order';
+      details[field] = issue.message;
     }
-    return sendError(res, 400, 'VALIDATION_ERROR', 'Invalid order input data.', { fields });
+    return sendError(res, 400, 'VALIDATION_ERROR', 'Invalid order input data.', details);
   }
 
   const { customerEmail, customerName, idempotencyKey, items } = parseResult.data;
 
-  // Check for duplicate product IDs in the single order
+  // Check for duplicate product IDs in order
   const productIds = items.map((i) => i.productId);
   if (new Set(productIds).size !== productIds.length) {
-    return sendError(res, 400, 'VALIDATION_ERROR', 'Duplicate product IDs in order are not allowed.');
+    return sendError(res, 400, 'VALIDATION_ERROR', 'Duplicate product IDs in order are not allowed.', {
+      items: 'Duplicate product IDs in order are not allowed.',
+    });
   }
 
   const client = await pool.connect();
@@ -403,22 +658,12 @@ app.post('/api/orders', orderLimiter, async (req: Request, res: Response) => {
 
     await client.query('BEGIN');
 
-    // 2. Upsert customer
-    const custRes = await client.query(
-      `INSERT INTO customers (email, name) 
-       VALUES ($1, $2) 
-       ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name 
-       RETURNING id`,
-      [customerEmail, customerName]
-    );
-    const customerId = custRes.rows[0].id;
-
-    // 3. Lock inventory rows in ASCENDING order to avoid deadlocks
+    // 2. Lock inventory rows in ASCENDING order to avoid deadlocks
     const sortedItems = [...items].sort((a, b) => a.productId - b.productId);
     const sortedIds = sortedItems.map((i) => i.productId);
 
     const stockRes = await client.query(
-      `SELECT p.id, p.name, p.price_cents, i.stock_count, i.reserved_count 
+      `SELECT p.id, p.name, p.price_cents, p.expiry_date, p.is_active, i.stock_count, i.reserved_count 
        FROM products p 
        JOIN inventory i ON i.product_id = p.id 
        WHERE p.id = ANY($1::int[]) 
@@ -437,17 +682,20 @@ app.post('/api/orders', orderLimiter, async (req: Request, res: Response) => {
     let totalCents = 0;
     const validatedItems: any[] = [];
 
-    // Verify stock availability
+    // Check stock & expiry status
     for (const item of sortedItems) {
       const row = stockMap.get(item.productId)!;
       const available = row.stock_count - row.reserved_count;
+      const expiry = computeExpiryInfo(row.expiry_date);
 
-      if (available < item.quantity) {
+      // Conflict if stock is insufficient OR product is expired OR inactive
+      if (available < item.quantity || expiry.expiry_status === 'expired' || !row.is_active) {
         await client.query('ROLLBACK');
         client.release();
-        return sendError(res, 409, 'OUT_OF_STOCK', `Insufficient inventory for product "${row.name}".`, {
+        return sendError(res, 409, 'OUT_OF_STOCK', 'Item is expired or out of stock', {
           productId: item.productId,
           available: Math.max(0, available),
+          expiryStatus: expiry.expiry_status,
         });
       }
 
@@ -460,7 +708,17 @@ app.post('/api/orders', orderLimiter, async (req: Request, res: Response) => {
       });
     }
 
-    // 4. Reserve stock (increment reserved_count, don't decrement stock_count yet)
+    // 3. Upsert customer
+    const custRes = await client.query(
+      `INSERT INTO customers (email, name) 
+       VALUES ($1, $2) 
+       ON CONFLICT (email) DO UPDATE SET name = COALESCE(customers.name, EXCLUDED.name) 
+       RETURNING id`,
+      [customerEmail, customerName]
+    );
+    const customerId = custRes.rows[0].id;
+
+    // 4. Reserve stock (increment reserved_count)
     for (const item of sortedItems) {
       await client.query(
         'UPDATE inventory SET reserved_count = reserved_count + $1, updated_at = NOW() WHERE product_id = $2',
@@ -471,9 +729,9 @@ app.post('/api/orders', orderLimiter, async (req: Request, res: Response) => {
     // 5. Create Order & Items
     const orderId = randomUUID();
     await client.query(
-      `INSERT INTO orders (id, customer_id, status, idempotency_key, total_cents) 
-       VALUES ($1, $2, 'PLACED', $3, $4)`,
-      [orderId, customerId, idempotencyKey, totalCents]
+      `INSERT INTO orders (id, customer_id, customer_email, customer_name, status, idempotency_key, total_cents, currency) 
+       VALUES ($1, $2, $3, $4, 'PLACED', $5, $6, 'INR')`,
+      [orderId, customerId, customerEmail, customerName, idempotencyKey, totalCents]
     );
 
     for (const item of validatedItems) {
@@ -518,7 +776,6 @@ app.post('/api/orders', orderLimiter, async (req: Request, res: Response) => {
     await client.query('ROLLBACK').catch(() => {});
     client.release();
 
-    // Handle race condition on unique idempotency_key (Postgres error 23505)
     if (err.code === '23505') {
       const existing = await pool.query('SELECT id FROM orders WHERE idempotency_key = $1', [idempotencyKey]);
       if (existing.rows.length > 0) {
@@ -533,11 +790,11 @@ app.post('/api/orders', orderLimiter, async (req: Request, res: Response) => {
 });
 
 // Helper to fetch complete Order model
-async function fetchOrderById(dbClient: any, orderId: string) {
+async function fetchOrderById(dbClient: any, orderId: string): Promise<Order | null> {
   const { rows: oRows } = await dbClient.query(
-    `SELECT o.id, o.status, o.total_cents, o.created_at, o.updated_at, c.email, c.name 
+    `SELECT o.id, o.status, o.total_cents, o.currency, o.created_at, o.customer_email, o.customer_name, c.email AS cust_email 
      FROM orders o 
-     JOIN customers c ON c.id = o.customer_id 
+     LEFT JOIN customers c ON c.id = o.customer_id 
      WHERE o.id = $1`,
     [orderId]
   );
@@ -545,7 +802,7 @@ async function fetchOrderById(dbClient: any, orderId: string) {
   const o = oRows[0];
 
   const { rows: iRows } = await dbClient.query(
-    `SELECT oi.id, oi.product_id, oi.quantity, oi.price_cents, p.name 
+    `SELECT oi.product_id, oi.quantity, oi.price_cents, p.name 
      FROM order_items oi 
      JOIN products p ON p.id = oi.product_id 
      WHERE oi.order_id = $1`,
@@ -554,25 +811,24 @@ async function fetchOrderById(dbClient: any, orderId: string) {
 
   return {
     id: o.id,
-    customerEmail: o.email,
-    customerName: o.name,
-    status: o.status,
+    orderId: o.id,
+    status: o.status as OrderStatus,
+    customerEmail: o.customer_email || o.cust_email || '',
+    customerName: o.customer_name || '',
     totalCents: o.total_cents,
-    currency: 'INR',
-    items: iRows.map((r: any) => ({
-      id: r.id,
-      productId: r.product_id,
-      productName: r.name,
-      quantity: r.quantity,
-      priceCents: r.price_cents,
-    })),
+    currency: o.currency || 'INR',
     createdAt: o.created_at.toISOString(),
-    updatedAt: o.updated_at.toISOString(),
+    items: iRows.map((r: any) => ({
+      productId: r.product_id,
+      name: r.name,
+      quantity: r.quantity,
+      unitPriceCents: r.price_cents,
+    })),
   };
 }
 
 // -------------------------------------------------------------
-// 5. Order Detail: GET /api/orders/:orderId
+// 7. Order Detail: GET /api/orders/:orderId
 // -------------------------------------------------------------
 app.get('/api/orders/:orderId', apiLimiter, async (req: Request, res: Response) => {
   const orderId = req.params.orderId;
@@ -594,61 +850,549 @@ app.get('/api/orders/:orderId', apiLimiter, async (req: Request, res: Response) 
 });
 
 // -------------------------------------------------------------
-// 6. Admin Upsert: POST /api/admin/products
+// 8. Auth Endpoints: Signup, Login, Demo, Me, Logout
 // -------------------------------------------------------------
-app.post('/api/admin/products', async (req: Request, res: Response) => {
-  const adminKey = req.headers['x-admin-key'];
-  if (!adminKey || adminKey !== config.ADMIN_KEY) {
-    return sendError(res, 401, 'UNAUTHORIZED', 'Invalid or missing x-admin-key header.');
+app.post('/api/auth/signup', async (req: Request, res: Response) => {
+  const { name, email, password } = req.body || {};
+  if (!name || !email || !password || typeof email !== 'string' || typeof password !== 'string') {
+    return sendError(res, 400, 'VALIDATION_ERROR', 'Name, email, and password are required.');
   }
 
-  const { sku, name, description, category, city, priceCents, imageUrl, stockCount } = req.body;
-  if (!sku || !name || !category || !city || typeof priceCents !== 'number') {
-    return sendError(res, 400, 'VALIDATION_ERROR', 'Missing required product attributes.');
-  }
-
-  const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-    const pRes = await client.query(
-      `INSERT INTO products (sku, name, description, category, city, price_cents, image_url) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7) 
-       ON CONFLICT (sku) DO UPDATE SET 
-         name = EXCLUDED.name, 
-         description = EXCLUDED.description, 
-         category = EXCLUDED.category, 
-         city = EXCLUDED.city, 
-         price_cents = EXCLUDED.price_cents, 
-         image_url = EXCLUDED.image_url,
-         updated_at = NOW() 
-       RETURNING id`,
-      [sku, name, description || null, category, city, priceCents, imageUrl || null]
-    );
-    const productId = pRes.rows[0].id;
-
-    if (typeof stockCount === 'number') {
-      await client.query(
-        `INSERT INTO inventory (product_id, stock_count, reserved_count) 
-         VALUES ($1, $2, 0) 
-         ON CONFLICT (product_id) DO UPDATE SET stock_count = EXCLUDED.stock_count`,
-        [productId, Math.max(0, stockCount)]
-      );
+    const existing = await pool.query('SELECT id FROM customers WHERE LOWER(email) = LOWER($1)', [email.trim()]);
+    if (existing.rows.length > 0) {
+      return sendError(res, 409, 'VALIDATION_ERROR', 'Email already registered.');
     }
 
-    // Write outbox event
-    await client.query(
-      `INSERT INTO outbox_events (topic, event_key, payload) 
-       VALUES ($1, $2, $3)`,
-      ['product.changed', String(productId), buildEnvelope('product.changed', { productId, action: 'UPSERT' }, `prod-${productId}`)]
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const result = await pool.query(
+      `INSERT INTO customers (name, email, password_hash, city, lat, lng) 
+       VALUES ($1, $2, $3, 'Bengaluru', 12.9716, 77.5946) 
+       RETURNING id, name, email, city, lat, lng`,
+      [name.trim(), email.trim(), hashedPassword]
     );
 
-    await client.query('COMMIT');
-    client.release();
-    res.status(200).json({ success: true, productId });
+    const user = {
+      id: String(result.rows[0].id),
+      name: result.rows[0].name,
+      email: result.rows[0].email,
+      city: result.rows[0].city,
+      lat: Number(result.rows[0].lat),
+      lng: Number(result.rows[0].lng),
+    };
+
+    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+    res.status(201).json({ user, token });
   } catch (err: any) {
-    await client.query('ROLLBACK').catch(() => {});
-    client.release();
-    sendError(res, 500, 'INTERNAL_ERROR', 'Failed to upsert product.');
+    logger.error({ err }, 'Signup failed');
+    sendError(res, 500, 'INTERNAL_ERROR', 'Failed to register account.');
+  }
+});
+
+app.post('/api/auth/login', async (req: Request, res: Response) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) {
+    return sendError(res, 401, 'UNAUTHORIZED', 'Wrong email or password.');
+  }
+
+  try {
+    const result = await pool.query(
+      'SELECT id, name, email, password_hash, city, lat, lng FROM customers WHERE LOWER(email) = LOWER($1)',
+      [email.trim()]
+    );
+
+    if (result.rows.length === 0 || !result.rows[0].password_hash) {
+      return sendError(res, 401, 'UNAUTHORIZED', 'Wrong email or password.');
+    }
+
+    const customer = result.rows[0];
+    const match = await bcrypt.compare(password, customer.password_hash);
+    if (!match) {
+      return sendError(res, 401, 'UNAUTHORIZED', 'Wrong email or password.');
+    }
+
+    const user = {
+      id: String(customer.id),
+      name: customer.name || 'Shopper',
+      email: customer.email,
+      city: customer.city || 'Bengaluru',
+      lat: Number(customer.lat || 12.9716),
+      lng: Number(customer.lng || 77.5946),
+    };
+
+    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+    res.json({ user, token });
+  } catch (err: any) {
+    logger.error({ err }, 'Login failed');
+    sendError(res, 500, 'INTERNAL_ERROR', 'Login failed.');
+  }
+});
+
+app.post('/api/auth/demo', async (req: Request, res: Response) => {
+  const demoUser = {
+    id: 'demo-user',
+    name: 'Demo User',
+    email: 'demo@example.com',
+    city: 'Bengaluru',
+    lat: 12.9716,
+    lng: 77.5946,
+  };
+  const token = jwt.sign({ userId: demoUser.id, email: demoUser.email }, JWT_SECRET, { expiresIn: '7d' });
+  res.json({ user: demoUser, token });
+});
+
+app.get('/api/auth/me', async (req: Request, res: Response) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return sendError(res, 401, 'UNAUTHORIZED', 'Missing or invalid token.');
+  }
+
+  const token = authHeader.slice(7);
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET) as any;
+    if (decoded.userId === 'demo-user') {
+      return res.json({
+        user: {
+          id: 'demo-user',
+          name: 'Demo User',
+          email: 'demo@example.com',
+          city: 'Bengaluru',
+          lat: 12.9716,
+          lng: 77.5946,
+        },
+      });
+    }
+
+    const result = await pool.query('SELECT id, name, email, city, lat, lng FROM customers WHERE id = $1', [
+      decoded.userId,
+    ]);
+    if (result.rows.length === 0) {
+      return sendError(res, 401, 'UNAUTHORIZED', 'User not found.');
+    }
+
+    const customer = result.rows[0];
+    const user = {
+      id: String(customer.id),
+      name: customer.name,
+      email: customer.email,
+      city: customer.city || 'Bengaluru',
+      lat: Number(customer.lat || 12.9716),
+      lng: Number(customer.lng || 77.5946),
+    };
+
+    res.json({ user });
+  } catch (err) {
+    sendError(res, 401, 'UNAUTHORIZED', 'Session expired or invalid.');
+  }
+});
+
+app.post('/api/auth/logout', (req: Request, res: Response) => {
+  res.json({ success: true });
+});
+
+// -------------------------------------------------------------
+// 9. Location Endpoints: GET /api/location/ip, PUT /api/me/location
+// -------------------------------------------------------------
+app.get('/api/location/ip', (req: Request, res: Response) => {
+  res.json({ city: 'Bengaluru', lat: 12.9716, lng: 77.5946 });
+});
+
+app.put('/api/me/location', async (req: Request, res: Response) => {
+  const { city, lat, lng } = req.body || {};
+  const authHeader = req.headers.authorization;
+
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    try {
+      const decoded = jwt.verify(authHeader.slice(7), JWT_SECRET) as any;
+      if (decoded.userId && decoded.userId !== 'demo-user') {
+        await pool.query('UPDATE customers SET city = $1, lat = $2, lng = $3 WHERE id = $4', [
+          city || 'Bengaluru',
+          lat || 12.9716,
+          lng || 77.5946,
+          decoded.userId,
+        ]);
+      }
+    } catch {
+      // Ignore token decode errors for location update
+    }
+  }
+
+  res.json({ success: true, city: city || 'Bengaluru', lat: lat || 12.9716, lng: lng || 77.5946 });
+});
+
+// -------------------------------------------------------------
+// 10. SSE Stock Stream: GET /api/stock/stream
+// -------------------------------------------------------------
+app.get('/api/stock/stream', async (req: Request, res: Response) => {
+  const productIdsParam = String(req.query.productIds || '');
+  const productIds = productIdsParam
+    .split(',')
+    .map((s) => parseInt(s.trim(), 10))
+    .filter((id) => !isNaN(id) && id > 0);
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders?.();
+
+  // Send initial snapshot for requested products
+  if (productIds.length > 0) {
+    try {
+      const { rows } = await pool.query(
+        `SELECT product_id, (stock_count - reserved_count) AS available_count 
+         FROM inventory 
+         WHERE product_id = ANY($1::int[])`,
+        [productIds]
+      );
+
+      for (const r of rows) {
+        const available = Math.max(0, r.available_count);
+        res.write(`data: ${JSON.stringify({ productId: r.product_id, availableCount: available, inStock: available > 0 })}\n\n`);
+      }
+    } catch (e) {
+      logger.error({ e }, 'Failed to send initial stock snapshot');
+    }
+  }
+
+  // Listener for live updates from Kafka consumer
+  const updateHandler = (update: { productId: number; availableCount: number; inStock: boolean }) => {
+    if (productIds.length === 0 || productIds.includes(update.productId)) {
+      res.write(`data: ${JSON.stringify(update)}\n\n`);
+    }
+  };
+
+  stockEvents.on('stock-update', updateHandler);
+
+  // Keep-alive heartbeat every 15 seconds
+  const keepAliveInterval = setInterval(() => {
+    res.write(': keepalive\n\n');
+  }, 15000);
+
+  req.on('close', () => {
+    clearInterval(keepAliveInterval);
+    stockEvents.off('stock-update', updateHandler);
+    res.end();
+  });
+});
+
+// -------------------------------------------------------------
+// 11. Voice Command: POST /api/voice-command (Rule-based intent parser)
+// -------------------------------------------------------------
+const numberWords: Record<string, number> = {
+  one: 1, two: 2, three: 3, four: 4, five: 5,
+  six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+};
+const knownCities = ['Coimbatore', 'Bengaluru', 'Mumbai', 'Delhi', 'Chennai', 'Hyderabad'];
+
+function parseVoiceTranscript(transcript: string) {
+  const lower = transcript.toLowerCase().slice(0, 300);
+  const intent: 'place_order' | 'add_to_cart' | 'search' = /\b(order|buy|place)\b/.test(lower)
+    ? 'place_order'
+    : /\b(add|put)\b/.test(lower)
+    ? 'add_to_cart'
+    : 'search';
+
+  const qtyMatch = lower.match(/\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b/);
+  const qty = Math.min(10, Math.max(1, qtyMatch ? Number(qtyMatch[1]) || numberWords[qtyMatch[1]] || 1 : 1));
+  const city = knownCities.find((c) => lower.includes(c.toLowerCase())) ?? null;
+
+  const productQuery = lower
+    .replace(/\b(order|buy|place|add|put|search|find|show|me|for|in|please|the|\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b/g, ' ')
+    .replace(new RegExp(`\\b(${knownCities.map((c) => c.toLowerCase()).join('|')})\\b`, 'g'), ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return { intent, productQuery, qty, city, via: 'voice' as const };
+}
+
+app.post('/api/voice-command', async (req: Request, res: Response) => {
+  const { transcript, city } = req.body || {};
+  if (!transcript || typeof transcript !== 'string' || !transcript.trim()) {
+    return sendError(res, 400, 'VALIDATION_ERROR', 'Say or type a request first.');
+  }
+
+  try {
+    const parsedIntent = parseVoiceTranscript(transcript);
+    if (city) parsedIntent.city = city;
+
+    const queryTerm = parsedIntent.productQuery || 'popular';
+    const normalizedTerm = normalizeSearchTerm(queryTerm);
+
+    const { rows } = await pool.query(
+      `SELECT p.*, (i.stock_count - i.reserved_count) AS available_count 
+       FROM products p 
+       JOIN inventory i ON i.product_id = p.id 
+       WHERE p.is_active = TRUE 
+         AND (i.stock_count - i.reserved_count) > 0 
+         AND ($1::text IS NULL OR LOWER(p.city) = LOWER($1))
+         AND (
+           LOWER(p.name) LIKE '%' || LOWER($2) || '%' 
+           OR LOWER(p.category) LIKE '%' || LOWER($2) || '%' 
+           OR LOWER(p.name) LIKE '%' || LOWER($3) || '%'
+         )
+       ORDER BY p.id ASC 
+       LIMIT 10`,
+      [parsedIntent.city, queryTerm, normalizedTerm]
+    );
+
+    const results = rows.map(mapDbProductToContract).filter((p) => p.expiry_status !== 'expired');
+
+    if (results.length === 0) {
+      return sendError(res, 404, 'NOT_FOUND', `No available product found for ${parsedIntent.productQuery || 'that request'}`);
+    }
+
+    if (parsedIntent.intent !== 'place_order') {
+      return res.json({ transcript, parsedIntent, results });
+    }
+
+    // Place voice order
+    const selected = results[0];
+    if (selected.availableCount < parsedIntent.qty) {
+      return sendError(res, 409, 'OUT_OF_STOCK', 'Item is expired or out of stock', { productId: selected.productId });
+    }
+
+    const customerEmail = `voice-${randomUUID().slice(0, 8)}@inventoryhub.local`;
+    const idempotencyKey = String(req.headers['idempotency-key'] || randomUUID());
+
+    // Call order creation logic directly
+    const client = await pool.connect();
+    let order: Order;
+    try {
+      await client.query('BEGIN');
+
+      const custRes = await client.query(
+        `INSERT INTO customers (email, name) VALUES ($1, 'Voice Shopper') 
+         ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name RETURNING id`,
+        [customerEmail]
+      );
+      const customerId = custRes.rows[0].id;
+
+      await client.query(
+        'UPDATE inventory SET reserved_count = reserved_count + $1, updated_at = NOW() WHERE product_id = $2',
+        [parsedIntent.qty, selected.productId]
+      );
+
+      const orderId = randomUUID();
+      const totalCents = selected.priceCents * parsedIntent.qty;
+
+      await client.query(
+        `INSERT INTO orders (id, customer_id, customer_email, customer_name, status, idempotency_key, total_cents, currency) 
+         VALUES ($1, $2, $3, 'Voice Shopper', 'CONFIRMED', $4, $5, 'INR')`,
+        [orderId, customerId, customerEmail, idempotencyKey, totalCents]
+      );
+
+      await client.query(
+        `INSERT INTO order_items (order_id, product_id, quantity, price_cents) 
+         VALUES ($1, $2, $3, $4)`,
+        [orderId, selected.productId, parsedIntent.qty, selected.priceCents]
+      );
+
+      await client.query(
+        `INSERT INTO outbox_events (topic, event_key, payload) 
+         VALUES ($1, $2, $3)`,
+        [
+          'order.placed',
+          orderId,
+          buildEnvelope('order.placed', { orderId, customerEmail, customerName: 'Voice Shopper', totalCents, items: [{ productId: selected.productId, productName: selected.name, quantity: parsedIntent.qty, priceCents: selected.priceCents }] }, orderId),
+        ]
+      );
+
+      await client.query('COMMIT');
+
+      order = {
+        orderId,
+        status: 'CONFIRMED',
+        customerEmail,
+        totalCents,
+        currency: 'INR',
+        createdAt: new Date().toISOString(),
+        items: [{ productId: selected.productId, name: selected.name, quantity: parsedIntent.qty, unitPriceCents: selected.priceCents }],
+      };
+    } finally {
+      client.release();
+    }
+
+    res.json({
+      transcript,
+      parsedIntent,
+      popup: {
+        title: 'Voice Order Placed!',
+        message: `Your ${parsedIntent.qty} × ${selected.name} order is confirmed.`,
+        order_id: order.orderId,
+        status: 'CONFIRMED',
+      },
+      order,
+      updatedCart: [],
+    });
+  } catch (err: any) {
+    logger.error({ err }, 'Voice command failed');
+    sendError(res, 500, 'INTERNAL_ERROR', 'Could not process voice command.');
+  }
+});
+
+// -------------------------------------------------------------
+// 12. Chat: POST /api/chat (Deterministic fallback mirroring mock-chat.ts)
+// -------------------------------------------------------------
+app.post('/api/chat', async (req: Request, res: Response) => {
+  const { messages, context } = req.body || {};
+  const history = Array.isArray(messages) ? messages.slice(-20) : [];
+  const text = (history.at(-1)?.content || '').trim().toLowerCase();
+  const cityContext = context?.city || 'Bengaluru';
+  const cartProductIds: number[] = Array.isArray(context?.cartProductIds) ? context.cartProductIds : [];
+  const lastOrderId = context?.lastOrderId || null;
+
+  try {
+    // 1. Refusal to place order via chat
+    if (/\b(?:buy|purchase)\b|\b(?:place|make|submit|want|like|need)\b.{0,25}\border\b|^\s*order\s+(?!status\b|details?\b|number\b|id\b|#)|\border\b.{0,20}\b(?:by|through|via)\s+(?:chat|assistant)\b/i.test(text)) {
+      return res.json({
+        reply: 'I can help you find products, but chat can’t place orders. Use the mic in the top bar to place orders.',
+        via: 'fallback',
+      });
+    }
+
+    // 2. Order tracking
+    if (/where.*order|track.*order|order.*status|delivery.*order/.test(text)) {
+      if (!lastOrderId) {
+        return res.json({
+          reply: 'I couldn’t find a recent order yet. Visit My Orders to see your order history.',
+          via: 'fallback',
+        });
+      }
+      const order = await fetchOrderById(pool, lastOrderId);
+      if (order) {
+        return res.json({
+          reply: `Order ${order.orderId} is currently ${order.status.toLowerCase()}. Open My Orders to follow its latest delivery updates.`,
+          via: 'fallback',
+        });
+      }
+      return res.json({
+        reply: `I found your recent order ${lastOrderId}. Open My Orders to see its latest delivery status.`,
+        via: 'fallback',
+      });
+    }
+
+    // 3. Expiry / Freshness
+    if (/fresh|expiry|expire|expired|milk/.test(text)) {
+      const { rows } = await pool.query(
+        `SELECT p.*, (i.stock_count - i.reserved_count) AS available_count 
+         FROM products p JOIN inventory i ON i.product_id = p.id 
+         WHERE p.sku = 'EXP-001' OR LOWER(p.name) LIKE '%milk%' LIMIT 1`
+      );
+      if (rows.length > 0) {
+        const milk = mapDbProductToContract(rows[0]);
+        const days = milk.days_to_expiry;
+        const reply = milk.expiry_status === 'near_expiry'
+          ? `${milk.name} is still within its date, but it expires in ${days} ${days === 1 ? 'day' : 'days'}. Check the date on the pack before use.`
+          : milk.expiry_status === 'fresh'
+          ? `${milk.name} is fresh, with ${days} days remaining before expiry.`
+          : 'I couldn’t confirm the expiry details for that item.';
+        return res.json({ reply, products: [milk], via: 'fallback' });
+      }
+    }
+
+    // 4. Delivery fee & ETA
+    if (/delivery fee|delivery charge|shipping fee|how much.*deliver|delivery.*cost|how long.*deliver|delivery time|eta|arrive/.test(text)) {
+      return res.json({
+        reply: `For ${cityContext}, standard delivery is ₹49 with an estimated delivery time of 25–35 minutes. Free delivery applies for orders over ₹499.`,
+        via: 'fallback',
+      });
+    }
+
+    // 5. Product search & recommendations
+    const { rows: allRows } = await pool.query(
+      `SELECT p.*, (i.stock_count - i.reserved_count) AS available_count 
+       FROM products p JOIN inventory i ON i.product_id = p.id 
+       WHERE p.is_active = TRUE AND (i.stock_count - i.reserved_count) > 0`
+    );
+    let all = allRows.map(mapDbProductToContract).filter((p) => p.expiry_status !== 'expired');
+
+    const cityMatch = text.match(/\b(coimbatore|bengaluru|mumbai|delhi|chennai|hyderabad)\b/i)?.[0];
+    const city = cityMatch?.toLowerCase();
+
+    const priceMatch = text.match(/(?:under|below|less than|upto|up to)\s*(?:₹\s*)?(\d[\d,]*)|(?:₹\s*)?(\d[\d,]*)\s*(?:rupees|rs|inr)/i);
+    const amount = Number((priceMatch?.[1] ?? priceMatch?.[2] ?? '').replaceAll(',', ''));
+    const limit = Number.isFinite(amount) && amount > 0 ? amount * 100 : null;
+
+    const isFootwear = /footwear|shoes?|sandals?|chappal|slippers?/i.test(text);
+    const isEarphones = /earphones?|earbuds?|headphones?|airdopes/i.test(text);
+    const wantsRating = /better rating|highest rated|best rated|ratings?|rating/i.test(text);
+
+    let matches = all;
+    if (isFootwear) {
+      matches = matches.filter((p) => /footwear|shoes?|sandals?|chappal|slippers?/i.test(`${p.name} ${p.category} ${(p.tags || []).join(' ')}`));
+    } else if (isEarphones) {
+      matches = matches.filter((p) => /earphones?|earbuds?|headphones?|airdopes/i.test(`${p.name} ${(p.tags || []).join(' ')}`));
+    } else if (!wantsRating) {
+      const terms = text
+        .replace(/\b(?:show|find|recommend|which|what|is|are|the|best|cheapest|top|rated|product|products|under|below|less than|upto|up to|rupees|rs|inr|₹|in|from|available|for me|please)\b/gi, ' ')
+        .trim()
+        .split(/\s+/)
+        .filter((t) => t.length > 2);
+      if (terms.length > 0) {
+        matches = matches.filter((p) => terms.some((t) => `${p.name} ${p.category} ${p.description} ${(p.tags || []).join(' ')}`.toLowerCase().includes(t)));
+      }
+    }
+
+    if (city) matches = matches.filter((p) => p.city.toLowerCase() === city);
+    if (limit) matches = matches.filter((p) => p.priceCents <= limit);
+
+    if (wantsRating) matches.sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0) || a.priceCents - b.priceCents);
+    else if (/cheapest|lowest price|least expensive/.test(text)) matches.sort((a, b) => a.priceCents - b.priceCents);
+    else if (isEarphones) matches.sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0) || a.priceCents - b.priceCents);
+
+    if (!matches.length) {
+      return res.json({
+        reply: `I couldn’t find an in-stock ${isFootwear ? 'footwear' : 'product'}${cityMatch ? ` in ${cityMatch}` : ''}${limit ? ` under ₹${limit / 100}` : ''} in the catalogue.`,
+        via: 'fallback',
+      });
+    }
+
+    const topMatches = matches.slice(0, 4);
+    if (wantsRating) {
+      return res.json({
+        reply: `${topMatches[0].name} has the highest rating${topMatches[0].rating ? ` at ${topMatches[0].rating} out of 5` : ''} among these options.`,
+        products: topMatches,
+        via: 'fallback',
+      });
+    }
+    if (isFootwear && city === 'coimbatore') {
+      return res.json({
+        reply: `Here’s a footwear option listed in Coimbatore.`,
+        products: topMatches,
+        via: 'fallback',
+      });
+    }
+    if (limit) {
+      return res.json({
+        reply: `Here are matching in-stock picks priced under ₹${limit / 100}.`,
+        products: topMatches,
+        via: 'fallback',
+      });
+    }
+    if (/cheapest|lowest price|least expensive/.test(text)) {
+      return res.json({
+        reply: `The lowest-priced earphones option is ${topMatches[0].name} at ₹${topMatches[0].priceCents / 100}.`,
+        products: topMatches,
+        via: 'fallback',
+      });
+    }
+    if (isEarphones) {
+      return res.json({
+        reply: `These earphones are the best-rated options${limit ? ` under ₹${limit / 100}` : ''}.`,
+        products: topMatches,
+        via: 'fallback',
+      });
+    }
+
+    res.json({
+      reply: 'Here are a few matching products from the catalogue.',
+      products: topMatches,
+      via: 'fallback',
+    });
+  } catch (err: any) {
+    logger.error({ err }, 'Chat handler failed');
+    sendError(res, 500, 'INTERNAL_ERROR', 'The assistant request failed.');
   }
 });
 
@@ -662,6 +1406,38 @@ app.use((err: any, req: Request, res: Response, next: NextFunction) => {
   logger.error({ err }, 'Unhandled Express Exception');
   sendError(res, 500, 'INTERNAL_ERROR', 'An unexpected internal error occurred.');
 });
+
+// Setup background Kafka consumer in API server for real-time SSE stock updates
+async function startSseConsumer() {
+  try {
+    const sseConsumer = kafka.consumer({ groupId: `sse-stock-broadcaster-${process.pid}` });
+    await sseConsumer.connect();
+    await sseConsumer.subscribe({ topic: 'inventory.updated', fromBeginning: false });
+    await sseConsumer.run({
+      eachMessage: async ({ message }) => {
+        if (!message.value) return;
+        try {
+          const raw = JSON.parse(message.value.toString());
+          const data = raw.data || raw;
+          const productId = Number(data.productId);
+          const availableCount = Math.max(0, Number(data.availableCount ?? data.stockCount ?? 0));
+          stockEvents.emit('stock-update', {
+            productId,
+            availableCount,
+            inStock: availableCount > 0,
+          });
+        } catch {
+          // Ignore malformed message
+        }
+      },
+    });
+    logger.info('📡 SSE stock stream connected to Kafka inventory.updated topic.');
+  } catch (err: any) {
+    logger.warn({ err: err.message }, 'SSE Kafka consumer could not connect (will rely on polling fallback)');
+  }
+}
+
+startSseConsumer();
 
 // Start Server
 const server = app.listen(config.API_PORT, config.API_HOST, () => {

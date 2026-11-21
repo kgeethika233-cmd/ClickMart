@@ -1,0 +1,6 @@
+import Link from 'next/link'
+import {Headphones,Shirt,Lamp,BookOpen,Dumbbell,ChevronRight,Sparkles} from 'lucide-react'
+import SearchBox from '@/components/search-box'
+import Featured from '@/components/featured'
+const departments=[['Electronics',Headphones],['Fashion',Shirt],['Home',Lamp],['Books',BookOpen],['Sports',Dumbbell]] as const
+export default function Home(){return <main className="wrap home"><section className="hero"><img className="hero-art" src="/market-hero.webp" alt="Lavender headphones, a mint sweatshirt, an orange camera and a peach mug on display"/><div className="hero-copy"><p className="hero-kicker"><Sparkles size={13}/> THE EVERYDAY MARKETPLACE</p><h1>Everyday finds.<br/><em>Endless possibilities.</em></h1><p className="intro">From tech essentials to home favourites, find it all in one place.</p><SearchBox hero/></div></section><section className="departments"><h2>Shop by category</h2><nav aria-label="Product categories" className="category-grid">{departments.map(([name,Icon])=><Link href={'/search?category='+name} data-category={name} key={name}><span className="department-icon"><Icon size={23} strokeWidth={1.8}/></span>{name}<ChevronRight className="chevron" size={15}/></Link>)}</nav></section><Featured/></main>}

@@ -1,0 +1,55 @@
+.button {
+  display: grid;
+  place-items: center;
+  flex: none;
+  border: 1px solid #e7e3ec;
+  border-radius: 999px;
+  background: #fff;
+  color: #6642dc;
+  box-shadow: 0 3px 12px #23183418;
+  transition: transform 160ms ease, background-color 160ms ease, color 160ms ease;
+}
+
+.button:hover {
+  transform: translateY(-1px);
+  background: #f7f4ff;
+}
+
+.button:focus-visible {
+  outline: 3px solid #835ced;
+  outline-offset: 3px;
+}
+
+.cardPhoto {
+  position: relative;
+  display: block;
+}
+
+.card {
+  position: absolute;
+  z-index: 2;
+  top: 12px;
+  right: 12px;
+  width: 40px;
+  height: 40px;
+}
+
+.detail {
+  width: 44px;
+  height: 44px;
+}
+
+.pop {
+  animation: wishlist-pop 260ms ease-out;
+}
+
+@keyframes wishlist-pop {
+  0% { transform: scale(0.72); }
+  60% { transform: scale(1.24); }
+  100% { transform: scale(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .button { transition: none; }
+  .pop { animation: none; }
+}

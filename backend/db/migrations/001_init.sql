@@ -1,3 +1,5 @@
+DROP TABLE IF EXISTS order_items, ledger_entries, notifications, outbox_events, processed_events, orders, inventory, products CASCADE;
+
 CREATE TABLE IF NOT EXISTS schema_migrations (
   id SERIAL PRIMARY KEY,
   filename VARCHAR(255) UNIQUE NOT NULL,
@@ -88,3 +90,4 @@ CREATE TABLE IF NOT EXISTS notifications (
 CREATE INDEX IF NOT EXISTS idx_products_category ON products(category);
 CREATE INDEX IF NOT EXISTS idx_products_city ON products(city);
 CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox_events(id) WHERE published_at IS NULL;
+

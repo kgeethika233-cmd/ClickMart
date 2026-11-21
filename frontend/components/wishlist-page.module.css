@@ -1,0 +1,113 @@
+.page {
+  min-height: 58vh;
+}
+
+.heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  margin-bottom: 26px;
+}
+
+.heading h1 {
+  margin: 4px 0 0;
+  color: #211e2b;
+  font-size: clamp(28px, 3vw, 38px);
+  letter-spacing: -1px;
+}
+
+.heading h1 span {
+  color: #898494;
+  font-size: 0.62em;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+
+.description {
+  margin: 8px 0 0;
+  color: #746f7d;
+  font-size: 14px;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.item {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+}
+
+.actions button:first-child {
+  min-width: 0;
+  flex: 1;
+}
+
+.skeletonCard,
+.unavailable {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid #eeecf1;
+  border-radius: 14px;
+  background: #fff;
+}
+
+.skeletonImage {
+  width: 100%;
+  aspect-ratio: 1.35;
+}
+
+.skeletonTitle {
+  width: 72%;
+  height: 20px;
+}
+
+.skeletonText {
+  width: 48%;
+  height: 14px;
+}
+
+.skeletonButton {
+  width: 100%;
+  height: 36px;
+  margin-top: 10px;
+}
+
+.unavailable {
+  align-items: flex-start;
+  justify-content: center;
+  min-height: 230px;
+  padding: 20px;
+  color: #746f7d;
+}
+
+.unavailable > svg {
+  color: #8e8798;
+}
+
+@media (max-width: 950px) {
+  .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+@media (max-width: 700px) {
+  .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .heading { align-items: flex-start; }
+}
+
+@media (max-width: 430px) {
+  .grid { grid-template-columns: 1fr; }
+  .heading { flex-direction: column; }
+}

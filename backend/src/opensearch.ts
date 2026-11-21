@@ -11,3 +11,4 @@ export const opensearch = new Client({
     rejectUnauthorized: false,
   },
 });
+

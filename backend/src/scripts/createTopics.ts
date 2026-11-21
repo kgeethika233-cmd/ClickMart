@@ -2,13 +2,10 @@ import { kafka } from '../kafka.js';
 import { logger } from '../logger.js';
 
 const TOPICS = [
-  { topic: 'order.placed', numPartitions: 3 },
-  { topic: 'order.placed.dlq', numPartitions: 1 },
-  { topic: 'inventory.updated', numPartitions: 3 },
-  { topic: 'notification.requested', numPartitions: 3 },
-  { topic: 'notification.requested.dlq', numPartitions: 1 },
-  { topic: 'product.changed', numPartitions: 3 },
-  { topic: 'product.changed.dlq', numPartitions: 1 },
+  { topic: 'order.placed', numPartitions: 1 },
+  { topic: 'inventory.updated', numPartitions: 1 },
+  { topic: 'notification.requested', numPartitions: 1 },
+  { topic: 'product.changed', numPartitions: 1 },
 ];
 
 async function createTopics() {
@@ -23,7 +20,7 @@ async function createTopics() {
     const topicsToCreate = TOPICS.filter((t) => !existingSet.has(t.topic));
 
     if (topicsToCreate.length === 0) {
-      logger.info('All required Kafka topics already exist.');
+      logger.info('All required Kafka topics already exist (<= 5 topics limit respected).');
     } else {
       logger.info(`Creating Kafka topics: ${topicsToCreate.map((t) => t.topic).join(', ')}`);
       await admin.createTopics({

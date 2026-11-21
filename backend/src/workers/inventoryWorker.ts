@@ -5,10 +5,8 @@ import { buildEnvelope } from '../events.js';
 
 async function run() {
   const consumer = kafka.consumer({ groupId: 'inventory-worker' });
-  const producer = kafka.producer();
 
   await consumer.connect();
-  await producer.connect();
   await consumer.subscribe({ topic: 'order.placed', fromBeginning: false });
 
   logger.info('Inventory worker subscribed to order.placed.');
@@ -16,7 +14,14 @@ async function run() {
   await consumer.run({
     eachMessage: async ({ message }) => {
       if (!message.value) return;
-      const raw = JSON.parse(message.value.toString());
+      let raw: any;
+      try {
+        raw = JSON.parse(message.value.toString());
+      } catch (e) {
+        logger.error('Failed to parse order.placed message JSON');
+        return;
+      }
+
       const eventId = String(raw.eventId || raw.data?.orderId || raw.orderId);
       const data = raw.data || raw;
 
@@ -45,10 +50,12 @@ async function run() {
           const items = (data.items || []).slice().sort((a: any, b: any) => a.productId - b.productId);
 
           for (const item of items) {
+            // Deduct from stock_count and decrement reserved_count
+            // (netting to exactly 1 total deduction between reservation & confirmation)
             const upd = await client.query(
               `UPDATE inventory 
-               SET stock_count = stock_count - $1, 
-                   reserved_count = reserved_count - $1,
+               SET stock_count = GREATEST(0, stock_count - $1), 
+                   reserved_count = GREATEST(0, reserved_count - $1),
                    updated_at = NOW() 
                WHERE product_id = $2 
                RETURNING stock_count, reserved_count`,
@@ -57,7 +64,7 @@ async function run() {
 
             if (upd.rows.length > 0) {
               const { stock_count, reserved_count } = upd.rows[0];
-              const availableCount = stock_count - reserved_count;
+              const availableCount = Math.max(0, stock_count - reserved_count);
 
               // Insert outbox event for inventory.updated
               const inventoryUpdatedData = {
@@ -65,6 +72,7 @@ async function run() {
                 stockCount: stock_count,
                 reservedCount: reserved_count,
                 availableCount,
+                inStock: availableCount > 0,
                 reason: 'ORDER_CONFIRMED',
                 orderId: data.orderId,
               };
@@ -81,7 +89,7 @@ async function run() {
             }
           }
 
-          // Confirm the order
+          // Move the order to CONFIRMED
           await client.query(
             "UPDATE orders SET status = 'CONFIRMED', updated_at = NOW() WHERE id = $1",
             [data.orderId]
@@ -113,7 +121,7 @@ async function run() {
           );
 
           await client.query('COMMIT');
-          logger.info(`Order #${data.orderId} successfully confirmed and inventory deducted.`);
+          logger.info(`✅ Order #${data.orderId} moved to CONFIRMED and inventory deducted.`);
           client.release();
           return;
         } catch (err: any) {
@@ -122,13 +130,13 @@ async function run() {
           retries++;
           logger.error({ err, retries }, 'Failed to process order.placed event');
           if (retries <= maxRetries) {
-            await new Promise((r) => setTimeout(r, Math.pow(2, retries) * 1000));
+            await new Promise((r) => setTimeout(r, Math.pow(2, retries) * 500));
           } else {
-            logger.error(`Dead-lettering event ${eventId} to order.placed.dlq`);
-            await producer.send({
-              topic: 'order.placed.dlq',
-              messages: [{ key: String(data.orderId || eventId), value: JSON.stringify(raw) }],
-            }).catch(() => {});
+            logger.error(`Dead-lettering event ${eventId} to Postgres dead_letter_events table`);
+            await pool.query(
+              `INSERT INTO dead_letter_events (topic, event_key, payload, error) VALUES ($1, $2, $3, $4)`,
+              ['order.placed', String(data.orderId || eventId), raw, err?.message || 'Max retries exceeded']
+            ).catch((e) => logger.error({ e }, 'Failed to write to dead_letter_events table'));
             return;
           }
         }

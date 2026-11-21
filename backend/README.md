@@ -43,3 +43,4 @@ OS_PASSWORD=your-opensearch-password
 | `dev:all` | `npm run dev:all` | Runs API server and all 4 workers concurrently with colored logs |
 | `contract:check` | `npm run contract:check` | Runs automated verification of contract compliance |
 | `test:concurrency` | `npm run test:concurrency` | Simulates 20 concurrent orders competing for 1 unit of stock |
+

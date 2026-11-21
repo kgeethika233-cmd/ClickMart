@@ -10,11 +10,21 @@ async function run() {
     maxInFlightRequests: 1,
   });
 
-  await producer.connect();
-  logger.info('Outbox publisher connected to Kafka.');
+  let connected = false;
+  while (isRunning && !connected) {
+    try {
+      await producer.connect();
+      connected = true;
+      logger.info('Outbox publisher connected to Kafka.');
+    } catch (err: any) {
+      logger.warn(`Failed to connect to Kafka (${err.message}), retrying in 3s...`);
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+  }
 
   while (isRunning) {
     const client = await pool.connect();
+    client.on('error', (err) => logger.warn({ err: err.message }, 'Client error ignored'));
     try {
       await client.query('BEGIN');
 
@@ -74,3 +84,4 @@ run().catch((err) => {
   logger.error({ err }, 'Outbox publisher crashed');
   process.exit(1);
 });
+

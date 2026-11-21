@@ -1,6 +1,7 @@
 import { pool } from '../db.js';
 import { opensearch } from '../opensearch.js';
 import { logger } from '../logger.js';
+import { computeExpiryInfo } from '../utils/expiry.js';
 
 async function reindexAll() {
   try {
@@ -15,6 +16,12 @@ async function reindexAll() {
         p.price_cents,
         p.currency,
         p.image_url,
+        p.rating,
+        p.delivery_time_mins,
+        p.delivery_fee,
+        p.distance_km,
+        p.tags,
+        p.expiry_date,
         p.is_active,
         p.updated_at,
         (i.stock_count - i.reserved_count) AS available_count
@@ -28,6 +35,9 @@ async function reindexAll() {
 
     const operations = products.flatMap((p) => {
       const available = Math.max(0, p.available_count);
+      const inStock = available > 0;
+      const expiry = computeExpiryInfo(p.expiry_date);
+
       return [
         { index: { _index: 'products', _id: String(p.product_id) } },
         {
@@ -38,10 +48,20 @@ async function reindexAll() {
           category: p.category,
           city: p.city,
           price: Number(p.price_cents) / 100,
+          price_cents: p.price_cents,
           currency: p.currency,
           image_url: p.image_url,
           stock_count: available,
-          in_stock: available > 0,
+          in_stock: inStock,
+          rating: p.rating ? Number(p.rating) : 4.5,
+          delivery_time_mins: p.delivery_time_mins ?? 30,
+          delivery_fee: p.delivery_fee ?? 49,
+          distance_km: p.distance_km ? Number(p.distance_km) : 3.5,
+          tags: Array.isArray(p.tags) ? p.tags : [],
+          expiry_date: expiry.expiry_date,
+          days_to_expiry: expiry.days_to_expiry,
+          expiry_status: expiry.expiry_status,
+          badge: expiry.badge,
           is_active: p.is_active,
           updated_at: p.updated_at,
         },

@@ -1,144 +1,20 @@
-// AUTO-COPIED, DO NOT EDIT.
-/**
- * Contract Types for Inventory Hub
- * CONTRACT_VERSION: 1.0.0
- * This file is the single source of truth for both Device A (backend) and Device B (frontend).
- */
-
+// AUTO-COPIED FROM contract/types.ts. DO NOT EDIT.
 export const CONTRACT_VERSION = '1.0.0';
-
-export const LIMITS = {
-  SEARCH_Q_MAX_LENGTH: 100,
-  SEARCH_PAGE_DEFAULT: 1,
-  SEARCH_PAGE_SIZE_DEFAULT: 12,
-  SEARCH_PAGE_SIZE_MAX: 50,
-  ORDER_ITEMS_MAX: 10,
-  ORDER_QUANTITY_MAX: 10,
-  CUSTOMER_NAME_MAX: 100,
-  CUSTOMER_EMAIL_MAX: 254,
-} as const;
-
-export const PRICE_RANGE_KEYS = [
-  'under-500',
-  '500-1500',
-  '1500-5000',
-  'above-5000',
-] as const;
-
-export type PriceRangeKey = typeof PRICE_RANGE_KEYS[number];
-
-export interface PriceRangeBucket {
-  key: PriceRangeKey;
-  label: string;
-  minPrice: number | null;
-  maxPrice: number | null;
-  count: number;
-}
-
-export type Category = 'Electronics' | 'Fashion' | 'Home' | 'Books' | 'Sports';
-export type City = 'Bengaluru' | 'Mumbai' | 'Delhi' | 'Chennai' | 'Hyderabad';
-
-export interface Product {
-  id: number;
-  sku: string;
-  name: string;
-  description: string | null;
-  category: Category;
-  city: City;
-  priceCents: number; // Integer paise (e.g. 199900 = ₹1,999.00)
-  currency: string;   // 'INR'
-  imageUrl: string | null;
-  availableCount: number;
-  inStock: boolean;
-}
-
-export interface SearchFacets {
-  categories: { value: Category; count: number }[];
-  cities: { value: City; count: number }[];
-  priceRanges: PriceRangeBucket[];
-}
-
-export interface SearchParams {
-  q?: string;
-  category?: Category[];
-  city?: City[];
-  minPrice?: number; // In paise
-  maxPrice?: number; // In paise
-  sort?: 'relevance' | 'price_asc' | 'price_desc';
-  page?: number;
-  pageSize?: number;
-}
-
-export interface SearchResponse {
-  products: Product[];
-  total: number;
-  page: number;
-  pageSize: number;
-  totalPages: number;
-  facets: SearchFacets;
-}
-
 export type OrderStatus = 'PLACED' | 'CONFIRMED' | 'CANCELLED';
-
-export interface OrderItem {
-  id: number;
-  productId: number;
-  productName: string;
-  quantity: number;
-  priceCents: number;
-}
-
-export interface Order {
-  id: string; // UUID
-  customerEmail: string;
-  customerName: string;
-  status: OrderStatus;
-  totalCents: number;
-  currency: string;
-  items: OrderItem[];
-  createdAt: string; // ISO 8601
-  updatedAt: string; // ISO 8601
-}
-
-export interface CreateOrderItemInput {
-  productId: number;
-  quantity: number;
-}
-
-export interface CreateOrderRequest {
-  customerEmail: string;
-  customerName: string;
-  idempotencyKey: string;
-  items: CreateOrderItemInput[];
-}
-
-export interface HealthResponse {
-  status: 'ok' | 'degraded' | 'down';
-  services: {
-    postgres: 'up' | 'down';
-    kafka: 'up' | 'down';
-    opensearch: 'up' | 'down';
-  };
-  contractVersion: string;
-}
-
-export type ErrorCode =
-  | 'VALIDATION_ERROR'
-  | 'NOT_FOUND'
-  | 'OUT_OF_STOCK'
-  | 'UNAUTHORIZED'
-  | 'RATE_LIMITED'
-  | 'INTERNAL_ERROR';
-
-export interface ContractError {
-  error: {
-    code: ErrorCode;
-    message: string;
-    details?: {
-      fields?: Record<string, string>;
-      productId?: number;
-      available?: number;
-      [key: string]: unknown;
-    };
-  };
-}
+export type SortOption = 'relevance' | 'price_asc' | 'price_desc';
+export type ServiceState = 'up' | 'down';
+export type ErrorCode = 'VALIDATION_ERROR' | 'UNAUTHORIZED' | 'NOT_FOUND' | 'OUT_OF_STOCK' | 'RATE_LIMITED' | 'INTERNAL_ERROR';
+export interface ApiErrorBody { error: { code: ErrorCode; message: string; details?: Record<string, unknown>; }; }
+export interface HealthResponse { status: 'ok' | 'degraded'; contractVersion: string; time: string; services: { postgres: ServiceState; kafka: ServiceState; opensearch: ServiceState; }; }
+export interface Product { productId: number; sku: string; name: string; description: string; category: string; city: string; priceCents: number; currency: string; imageUrl: string | null; inStock: boolean; availableCount: number; tags?: string[]; rating?: number; delivery_time_mins?: number; delivery_fee?: number; distance_km?: number; delivery_status?: string; stock?: number; expiry_date?: string | null; days_to_expiry?: number | null; expiry_status?: 'none' | 'fresh' | 'near_expiry' | 'expired'; badge?: string | null; }
+export interface FacetBucket { value: string; count: number; }
+export interface PriceRangeBucket { key: 'lt-500' | '500-2000' | '2000-10000' | 'gt-10000'; label: string; minPrice: number | null; maxPrice: number | null; count: number; }
+export interface SearchFacets { categories: FacetBucket[]; cities: FacetBucket[]; priceRanges: PriceRangeBucket[]; ratings?: FacetBucket[]; delivery_buckets?: FacetBucket[]; price?: { min: number; max: number }; }
+export interface SearchResponse { total: number; page: number; pageSize: number; totalPages: number; items: Product[]; facets: SearchFacets; }
+export interface SearchParams { q?: string; category?: string[]; city?: string[]; minPrice?: number; maxPrice?: number; rating?: number; delivery?: string; sort?: SortOption; page?: number; pageSize?: number; }
+export interface CreateOrderItem { productId: number; quantity: number; }
+export interface CreateOrderRequest { customerEmail: string; customerName: string; idempotencyKey: string; items: CreateOrderItem[]; }
+export interface OrderItem { productId: number; name: string; quantity: number; unitPriceCents: number; }
+export interface Order { orderId: string; status: OrderStatus; customerEmail: string; totalCents: number; currency: string; createdAt: string; items: OrderItem[]; }
+export const LIMITS = { searchQueryMaxLength: 100, pageSizeDefault: 20, pageSizeMax: 50, quantityMin: 1, quantityMax: 10, itemsPerOrderMax: 20, emailMaxLength: 254, nameMaxLength: 100, idempotencyKeyMin: 8, idempotencyKeyMax: 100 } as const;
+export const PRICE_RANGE_KEYS = ['lt-500', '500-2000', '2000-10000', 'gt-10000'] as const;

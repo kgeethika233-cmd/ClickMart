@@ -1,0 +1,41 @@
+'use client'
+import { Suspense, useEffect, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
+import { useRouter, useSearchParams } from 'next/navigation'
+import ProductCard from '@/components/product-card'
+import { getAutocomplete, getLatestImageSearch, searchProducts, type ImageSearchResult } from '@/lib/api'
+import type { Product } from '@/types/contract'
+import styles from './search-results.module.css'
+
+function SearchResultsContent() {
+  const params = useSearchParams(), router = useRouter()
+  const query = params.get('q') ?? '', expiry = params.get('expiry') ?? 'any'
+  const [imageSearch, setImageSearch] = useState<ImageSearchResult | null>(null), [mobileFilters, setMobileFilters] = useState(false), [corrected, setCorrected] = useState<string | null>(null)
+  const categories = params.getAll('category'), cities = params.getAll('city'), rating = Number(params.get('rating') || 0), delivery = params.get('delivery') || 'any'
+  const setParam = (key: string, value: string, multiple = false) => { const next = new URLSearchParams(params.toString()); if (multiple) { const selected = next.getAll(key); next.delete(key); (selected.includes(value) ? selected.filter(item => item !== value) : [...selected, value]).forEach(item => next.append(key, item)) } else if (value) next.set(key, value); else next.delete(key); router.push(`/search${next.size ? `?${next}` : ''}`) }
+  useEffect(() => { setImageSearch(getLatestImageSearch()); const handler = (event: Event) => setImageSearch((event as CustomEvent<ImageSearchResult>).detail); window.addEventListener('inventory:image-results', handler); return () => window.removeEventListener('inventory:image-results', handler) }, [])
+  useEffect(() => { let active = true; setCorrected(null); if (query) getAutocomplete(query).then(result => { if (active && result.corrections.length) setCorrected(result.corrections.map(item => item.to).join(' ')) }).catch(() => {}); return () => { active = false } }, [query])
+  const search = useQuery({ queryKey: ['search', query, expiry, categories, cities, rating, delivery, params.get('minPrice'), params.get('maxPrice')], queryFn: () => searchProducts({ q: query, category: categories, city: cities, rating: rating || undefined, delivery, minPrice: Number(params.get('minPrice')) || undefined, maxPrice: Number(params.get('maxPrice')) || undefined, expiry }) })
+  const products: Product[] = imageSearch && params.get('image') && !query ? imageSearch.products : search.data?.items ?? []
+  const categoriesFacet = search.data?.facets.categories ?? [], citiesFacet = search.data?.facets.cities ?? []
+  const clearAll = () => router.push(`/search${query ? `?q=${encodeURIComponent(query)}` : ''}`)
+  const activeChips = [...categories.map(value => ['category', value] as const), ...cities.map(value => ['city', value] as const), ...(rating ? [['rating', `${rating}+ stars`] as const] : []), ...(delivery !== 'any' ? [['delivery', delivery] as const] : []), ...(params.get('minPrice') ? [['minPrice', `From ₹${params.get('minPrice')}`] as const] : []), ...(params.get('maxPrice') ? [['maxPrice', `Up to ₹${params.get('maxPrice')}`] as const] : [])]
+  const filters = <div className={styles.filtersContent}>
+    <div className={styles.filterTitle}><h2>Filters</h2>{activeChips.length > 0 && <button onClick={clearAll}>Clear all</button>}</div>
+    <section className={styles.filterGroup}><h3>Price range</h3><div className={styles.priceInputs}><label>Min ₹<input aria-label="Minimum price" type="number" min="0" value={params.get('minPrice') ?? ''} onChange={event => setParam('minPrice', event.target.value)}/></label><label>Max ₹<input aria-label="Maximum price" type="number" min="0" value={params.get('maxPrice') ?? ''} onChange={event => setParam('maxPrice', event.target.value)}/></label></div></section>
+    <section className={styles.filterGroup}><h3>Category</h3>{categoriesFacet.map(item => <label key={item.value}><input type="checkbox" checked={categories.includes(item.value)} onChange={() => setParam('category', item.value, true)}/>{item.value}<small>{item.count}</small></label>)}</section>
+    <section className={styles.filterGroup}><h3>Rating</h3>{[4,3,2,1].map(value => <label key={value}><input type="radio" name="rating" checked={rating === value} onChange={() => setParam('rating', String(value))}/>{value} stars &amp; up</label>)}</section>
+    <section className={styles.filterGroup}><h3>Delivery time</h3><select aria-label="Delivery time" value={delivery} onChange={event => setParam('delivery', event.target.value)}><option value="any">Any</option><option value="30">Under 30 min</option><option value="60">Under 60 min</option><option value="same-day">Same day</option></select></section>
+    <section className={styles.filterGroup}><h3>Place / City</h3>{citiesFacet.map(item => <label key={item.value}><input type="checkbox" checked={cities.includes(item.value)} onChange={() => setParam('city', item.value, true)}/>{item.value}<small>{item.count}</small></label>)}</section>
+    <label className={styles.expiry}>Expiry <select aria-label="Filter by expiry" value={expiry} onChange={event => setParam('expiry', event.target.value === 'any' ? '' : event.target.value)}><option value="any">Any</option><option value="7">Expires within 7 days</option><option value="30">Expires within 30 days</option><option value="nonperishable">Non-perishable only</option></select></label>
+  </div>
+  return <main className="wrap commerce-page search-results-page"><div className="section-head"><div><p className="eyebrow">THE CATALOG</p><h1>{query ? `Results for “${query}”` : imageSearch && params.get('image') ? 'Visual search results' : 'Explore products'}</h1><p>{products.length}{' '}{products.length === 1 ? 'product' : 'products'} to discover</p></div><button className={styles.mobileFilterButton} onClick={() => setMobileFilters(true)}>Filters</button></div>
+    {corrected && <p className={styles.correction}>Showing results for <strong>{corrected}</strong>. <button onClick={() => setParam('q', query)}>Search instead for {query}</button></p>}
+    {imageSearch && params.get('image') && <div className={styles.detected}><strong>We detected:</strong>{imageSearch.detected.keywords.map(word => <button key={word} onClick={() => { const terms = imageSearch.detected.keywords.filter(term => term !== word); setImageSearch({ ...imageSearch, detected: { ...imageSearch.detected, keywords: terms } }); router.push(`/search?image=1${terms.length ? `&q=${encodeURIComponent(terms.join(' '))}` : ''}`) }}>{word} ×</button>)}</div>}
+    <div className={styles.layout}><aside className={styles.sidebar}>{filters}</aside><div className={styles.results}>{activeChips.length > 0 && <div className={styles.chips}>{activeChips.map(([key, value]) => <button key={`${key}-${value}`} onClick={() => setParam(key, key === 'rating' || key === 'delivery' || key === 'minPrice' || key === 'maxPrice' ? '' : value, key === 'category' || key === 'city')}>{value} ×</button>)}<button onClick={clearAll}>Clear all</button></div>}
+    {search.isPending && !imageSearch ? <div role="status" className={styles.skeletonGrid} aria-label="Loading products"><span/><span/><span/><span/></div> : search.isError && !imageSearch ? <div role="alert" className="state-card"><h2>Could not load products</h2><p>{search.error.message}</p><button className="primary-action" onClick={() => void search.refetch()}>Try again</button></div> : products.length ? <section className="products" aria-label="Search results">{products.map(product => <ProductCard key={product.productId} product={product}/>)}</section> : <div className="state-card"><h2>No products found</h2><p>Try a different search or remove a filter.</p></div>}
+    </div></div>
+    {mobileFilters && <div className={styles.sheetBackdrop} onClick={() => setMobileFilters(false)}><section className={styles.sheet} role="dialog" aria-modal="true" aria-label="Product filters" onClick={event => event.stopPropagation()}>{filters}<button className={styles.applyFilters} onClick={() => setMobileFilters(false)}>Show results</button></section></div>}
+  </main>
+}
+export default function SearchResults() { return <Suspense fallback={<main className="wrap commerce-page"><p role="status">Loading search…</p></main>}><SearchResultsContent/></Suspense> }

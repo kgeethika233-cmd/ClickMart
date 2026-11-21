@@ -71,3 +71,4 @@ run().catch((err) => {
   logger.error({ err }, 'Notification worker crashed');
   process.exit(1);
 });
+
