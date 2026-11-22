@@ -29,7 +29,7 @@ function withProducts(reply: string, products: Product[]): ChatResponse {
 export async function mockChatReply(messages: ChatMessage[], context: ChatContext): Promise<ChatResponse> {
   await new Promise(resolve => setTimeout(resolve, 350))
   const text = messages.at(-1)?.content.trim().toLowerCase() ?? ''
-  if (/\b(?:buy|purchase)\b|\b(?:place|make|submit|want|like|need)\b.{0,25}\border\b|^\s*order\s+(?!status\b|details?\b|number\b|id\b|#)|\border\b.{0,20}\b(?:by|through|via)\s+(?:chat|assistant)\b/i.test(text)) {
+  if (/\b(?:buy|purchase)\b|\b(?:place|make|submit)\b.{0,25}\border\b|\b(?:want|need|would like)\s+to\s+(?:buy|purchase|order)\b|^\s*order\s+(?!status\b|details?\b|number\b|id\b|#)|\border\b.{0,20}\b(?:by|through|via)\s+(?:chat|assistant)\b/i.test(text)) {
     return { reply: 'I can help you find products, but chat can’t place orders. Use the mic in the top bar to place orders.', via: 'fallback' }
   }
   if (/where.*order|track.*order|order.*status|delivery.*order/.test(text)) {

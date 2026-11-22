@@ -13,8 +13,9 @@ import { notifyCartAdded } from '@/lib/notify-store'
 import styles from './chat-widget.module.css'
 
 type Entry = ChatMessage & { id: string; time: string; products?: Product[]; via?: 'qwen' | 'fallback'; failed?: boolean; retryText?: string }
-type SpeechResult = { transcript: string; isFinal: boolean }
-type SpeechEvent = { results: ArrayLike<ArrayLike<SpeechResult>> }
+type SpeechAlternative = { transcript: string }
+type SpeechResult = ArrayLike<SpeechAlternative> & { isFinal: boolean }
+type SpeechEvent = { results: ArrayLike<SpeechResult> }
 type Recognition = { lang: string; interimResults: boolean; continuous: boolean; onresult: ((event: SpeechEvent) => void) | null; onerror: ((event: { error: string }) => void) | null; onend: (() => void) | null; start: () => void; stop: () => void }
 type RecognitionConstructor = new () => Recognition
 const STORAGE_KEY = 'chat:v1'
@@ -45,6 +46,7 @@ export default function ChatWidget() {
   const finalTranscriptRef = useRef('')
   const busyRef = useRef(false)
   const endRef = useRef<HTMLDivElement>(null)
+  const panelRef = useRef<HTMLElement | null>(null)
   const [storageReady, setStorageReady] = useState(false)
 
   useEffect(() => {
@@ -67,7 +69,18 @@ export default function ChatWidget() {
   useEffect(() => { if (open) endRef.current?.scrollIntoView({ behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth', block: 'end' }) }, [messages, loading, hearing, open])
   useEffect(() => {
     if (!open) return
-    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') closeChat() }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') { closeChat(); return }
+      if (event.key !== 'Tab') return
+      const panel = panelRef.current
+      const focusable = panel?.querySelectorAll<HTMLElement>('button:not(:disabled), a[href], textarea:not(:disabled), input:not(:disabled)')
+      if (!panel || !focusable?.length) return
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (!panel.contains(document.activeElement)) { event.preventDefault(); first.focus() }
+      else if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus() }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus() }
+    }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [open])
@@ -89,7 +102,7 @@ export default function ChatWidget() {
     busyRef.current = true
     setLoading(true)
     setDraft('')
-    const orderIntent = /\b(?:buy|purchase)\b|\b(?:place|make|submit|want|like|need)\b.{0,25}\border\b|^\s*order\s+(?!status\b|details?\b|number\b|id\b|#)|\border\b.{0,20}\b(?:by|through|via)\s+(?:chat|assistant)\b/i.test(content)
+    const orderIntent = /\b(?:buy|purchase)\b|\b(?:place|make|submit)\b.{0,25}\border\b|\b(?:want|need|would like)\s+to\s+(?:buy|purchase|order)\b|^\s*order\s+(?!status\b|details?\b|number\b|id\b|#)|\border\b.{0,20}\b(?:by|through|via)\s+(?:chat|assistant)\b/i.test(content)
     if (orderIntent) {
       setMessages(current => [...current.filter(message => !message.failed), ...(retry ? [] : [createEntry('user', content)]), createEntry('assistant', 'I can help you find products, but chat can’t place orders. Use the mic in the top bar to place orders.')].slice(-20))
       setLoading(false)
@@ -124,7 +137,7 @@ export default function ChatWidget() {
         for (let index = 0; index < event.results.length; index++) {
           const result = event.results[index]?.[0]
           if (!result) continue
-          if (event.results[index]?.[0]?.isFinal) finalText += result.transcript
+          if (event.results[index]?.isFinal) finalText += result.transcript
           else interimText += result.transcript
         }
         finalTranscriptRef.current = finalText.trim()
@@ -157,7 +170,7 @@ export default function ChatWidget() {
 
   return <>
     {!open && <button ref={launcherRef} className={styles.launcher} aria-label="Open Shop Helper chat" onClick={() => setOpen(true)}><MessageCircle size={23} strokeWidth={2.2} />{unread && <span className={styles.unread} aria-label="Unread message" />}</button>}
-    {open && <section className={styles.panel} role="dialog" aria-modal="true" aria-labelledby="shop-helper-title">
+    {open && <section ref={panelRef} className={styles.panel} role="dialog" aria-modal="true" aria-labelledby="shop-helper-title">
       <header className={styles.header}>
         <span className={styles.avatar}><Bot size={19} /></span>
         <div className={styles.heading}><strong id="shop-helper-title">Shop Helper</strong><span><i />Online</span></div>

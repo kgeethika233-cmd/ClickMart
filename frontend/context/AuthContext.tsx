@@ -23,16 +23,10 @@ function LocationPrompt({ onDone }: { onDone: () => void }) {
     try {
       const location = coords ?? await getLocationByIp()
       const stored = locationForCoordinates(location)
-      await updateLocation({ city: stored.city, lat: stored.lat, lng: stored.lng })
       saveUserLocation(stored)
-    } catch {
-      try {
-        const fallback = await getLocationByIp()
-        const stored = locationForCoordinates(fallback)
-        await updateLocation(fallback)
-        saveUserLocation(stored)
-      } catch { /* Location is optional when the service is unavailable. */ }
-    } finally { setBusy(false); onDone() }
+      try { await updateLocation({ city: stored.city, lat: stored.lat, lng: stored.lng }) } catch { /* Keep the local delivery estimate if the account service is unavailable. */ }
+    } catch { /* Location is optional when the IP lookup is unavailable. */ }
+    finally { setBusy(false); onDone() }
   }
   const allow = () => {
     if (!navigator.geolocation) { void resolveLocation(); return }
