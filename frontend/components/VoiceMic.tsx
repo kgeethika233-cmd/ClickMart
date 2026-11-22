@@ -11,7 +11,7 @@ import { addOrder } from '@/lib/orders-local'
 import { notifyCartAdded, notifyOrderPlaced } from '@/lib/notify-store'
 import styles from './voice-mic.module.css'
 
-type RecognitionResult = { transcript: string }
+type RecognitionResult = { transcript: string; isFinal?: boolean }
 type RecognitionEvent = { results: ArrayLike<ArrayLike<RecognitionResult>> }
 type Recognition = { lang: string; interimResults: boolean; continuous: boolean; onresult: ((event: RecognitionEvent) => void) | null; onerror: ((event: { error: string }) => void) | null; onend: (() => void) | null; start: () => void; stop: () => void }
 type RecognitionConstructor = new () => Recognition
@@ -111,20 +111,26 @@ export default function VoiceMic() {
         let finalText = ''
         let interimText = ''
         for (let i = 0; i < event.results.length; i++) {
-          const entry = event.results[i]
-          if (entry?.[0]) finalText += entry[0].transcript
+          const result = event.results[i]?.[0]
+          if (!result?.transcript) continue
+          if (result.isFinal) finalText += `${finalText ? ' ' : ''}${result.transcript}`
+          else interimText += `${interimText ? ' ' : ''}${result.transcript}`
         }
-        interimText = finalText.slice(0, 300)
-        setHearing(interimText)
-        if (interimText) setTranscript(interimText)
+        const heard = [finalText, interimText].filter(Boolean).join(' ').slice(0, 300)
+        setHearing(heard)
+        if (heard) setTranscript(heard)
       }
       recognition.onerror = event => {
         setListening(false)
         if (event.error === 'not-allowed' || event.error === 'service-not-allowed') setSpeechUnavailable(true)
         else toast.error('Could not hear that. You can type your request instead.')
       }
-      recognition.onend = () => setListening(false)
+      recognition.onend = () => {
+        setListening(false)
+        recognitionRef.current = null
+      }
       recognitionRef.current = recognition
+      setTranscript('')
       setHearing('')
       setListening(true)
       recognition.start()
