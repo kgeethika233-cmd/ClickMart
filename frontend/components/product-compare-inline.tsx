@@ -11,7 +11,7 @@ import styles from './product-compare-inline.module.css'
 
 const OPEN_EVENT = 'product-compare:open'
 function badges(labels: string[]) { return labels.length ? <div className={styles.badges}>{labels.map(label => <span className={styles.badge} key={label}>{label}</span>)}</div> : null }
-export default function ProductCompareInline({ product }: { product: Product }) {
+export default function ProductCompareInline({ product, compact = false }: { product: Product; compact?: boolean }) {
   const [open, setOpen] = useState(false)
   const [location, setLocation] = useState<StoredUserLocation | null>(null)
   const panelId = `product-compare-${product.productId}`
@@ -27,7 +27,7 @@ export default function ProductCompareInline({ product }: { product: Product }) 
     if (next) window.dispatchEvent(new CustomEvent(OPEN_EVENT, { detail: product.productId }))
     else setOpen(false)
   }
-  return <div className={styles.root}>
+  return <div className={`${styles.root} ${compact ? styles.compact : ''}`}>
     <button type="button" className={styles.trigger} aria-expanded={open} aria-controls={panelId} onClick={toggle}><GitCompareArrows aria-hidden="true" />Compare {open ? <ChevronUp aria-hidden="true" /> : <ChevronDown aria-hidden="true" />}</button>
     {open && <section className={styles.panel} id={panelId} aria-label={`Store comparison for ${product.name}`}>
       <div className={styles.heading}><div><strong>Compare nearby stores</strong><span>{location ? `Delivery options near ${location.name}, ${location.city}` : 'Compare prices, delivery and stock by store.'}</span></div><Link href="/compare">Compare full basket</Link></div>

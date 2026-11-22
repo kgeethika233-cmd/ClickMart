@@ -12,15 +12,16 @@ import { formatINR } from '@/lib/format'
 import { notifyCartAdded } from '@/lib/notify-store'
 import styles from './chat-widget.module.css'
 
-type Entry = ChatMessage & { id: string; time: string; products?: Product[]; via?: 'qwen' | 'fallback'; failed?: boolean; retryText?: string }
-type SpeechResult = { transcript: string; isFinal: boolean }
-type SpeechEvent = { results: ArrayLike<ArrayLike<SpeechResult>> }
+type Entry = ChatMessage & { id: string; time: string; products?: Product[]; actions?: ChatResponse['actions']; via?: 'qwen' | 'fallback'; failed?: boolean; retryText?: string }
+type SpeechAlternative = { transcript: string }
+type SpeechResult = ArrayLike<SpeechAlternative> & { isFinal: boolean }
+type SpeechEvent = { results: ArrayLike<SpeechResult> }
 type Recognition = { lang: string; interimResults: boolean; continuous: boolean; onresult: ((event: SpeechEvent) => void) | null; onerror: ((event: { error: string }) => void) | null; onend: (() => void) | null; start: () => void; stop: () => void }
 type RecognitionConstructor = new () => Recognition
 const STORAGE_KEY = 'chat:v1'
 const SPEAK_KEY = 'voice-speak:v1'
-const greeting = 'Hi there! I’m Shop Helper. Ask me about an order, fresh products, delivery, or what to buy.'
-const quickReplies = ['Where is my order?', 'Is this milk fresh?', 'Which earphones are best under ₹1500?']
+const greeting = 'Hi there! I’m Shop Helper. Ask about any product, price, stock, delivery, nearby stores, or how to use the store.'
+const quickReplies = ['Find a product under ₹1,000', 'How do I compare stores?', 'Tell me about Bluetooth Speaker']
 function createEntry(role: ChatMessage['role'], content: string, extra?: Partial<ChatResponse> & { failed?: boolean; retryText?: string }): Entry { return { role, content, id: `${Date.now()}-${Math.random()}`, time: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }), ...extra } }
 function greetingEntry(): Entry { return createEntry('assistant', greeting) }
 
@@ -45,6 +46,7 @@ export default function ChatWidget() {
   const finalTranscriptRef = useRef('')
   const busyRef = useRef(false)
   const endRef = useRef<HTMLDivElement>(null)
+  const panelRef = useRef<HTMLElement | null>(null)
   const [storageReady, setStorageReady] = useState(false)
 
   useEffect(() => {
@@ -67,7 +69,18 @@ export default function ChatWidget() {
   useEffect(() => { if (open) endRef.current?.scrollIntoView({ behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth', block: 'end' }) }, [messages, loading, hearing, open])
   useEffect(() => {
     if (!open) return
-    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') closeChat() }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') { closeChat(); return }
+      if (event.key !== 'Tab') return
+      const panel = panelRef.current
+      const focusable = panel?.querySelectorAll<HTMLElement>('button:not(:disabled), a[href], textarea:not(:disabled), input:not(:disabled)')
+      if (!panel || !focusable?.length) return
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (!panel.contains(document.activeElement)) { event.preventDefault(); first.focus() }
+      else if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus() }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus() }
+    }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [open])
@@ -89,7 +102,7 @@ export default function ChatWidget() {
     busyRef.current = true
     setLoading(true)
     setDraft('')
-    const orderIntent = /\b(?:buy|purchase)\b|\b(?:place|make|submit|want|like|need)\b.{0,25}\border\b|^\s*order\s+(?!status\b|details?\b|number\b|id\b|#)|\border\b.{0,20}\b(?:by|through|via)\s+(?:chat|assistant)\b/i.test(content)
+    const orderIntent = /\b(?:place|make|submit)\s+(?:an?\s+)?order\b|\b(?:order|purchase|checkout)\b.{0,30}\b(?:through|via|in)\s+(?:chat|assistant)\b/i.test(content)
     if (orderIntent) {
       setMessages(current => [...current.filter(message => !message.failed), ...(retry ? [] : [createEntry('user', content)]), createEntry('assistant', 'I can help you find products, but chat can’t place orders. Use the mic in the top bar to place orders.')].slice(-20))
       setLoading(false)
@@ -100,9 +113,10 @@ export default function ChatWidget() {
     const history = base.slice(-20)
     if (!retry) setMessages(history)
     try {
-      const context = { city: location?.city ?? 'Bengaluru', cartProductIds: items.map(item => item.productId), lastOrderId: getOrders()[0]?.orderId ?? null }
+      const lastProductIds = [...messages].reverse().find(message => message.role === 'assistant' && message.products?.length)?.products?.map(product => product.productId) ?? []
+      const context = { city: location?.city ?? 'Bengaluru', cartProductIds: items.map(item => item.productId), lastOrderId: getOrders()[0]?.orderId ?? null, lastProductIds }
       const response = await sendChat(history.map(({ role, content: messageContent }) => ({ role, content: messageContent })), context)
-      setMessages(current => [...current.filter(message => !message.failed), createEntry('assistant', response.reply, { products: response.products, via: response.via })].slice(-20))
+      setMessages(current => [...current.filter(message => !message.failed), createEntry('assistant', response.reply, { products: response.products, actions: response.actions, via: response.via })].slice(-20))
       speak(response.reply)
     } catch {
       setMessages(current => [...current.filter(message => !message.failed), createEntry('assistant', 'Couldn’t reach the assistant. Please try again.', { failed: true, retryText: content })].slice(-20))
@@ -124,7 +138,7 @@ export default function ChatWidget() {
         for (let index = 0; index < event.results.length; index++) {
           const result = event.results[index]?.[0]
           if (!result) continue
-          if (event.results[index]?.[0]?.isFinal) finalText += result.transcript
+          if (event.results[index]?.isFinal) finalText += result.transcript
           else interimText += result.transcript
         }
         finalTranscriptRef.current = finalText.trim()
@@ -157,7 +171,7 @@ export default function ChatWidget() {
 
   return <>
     {!open && <button ref={launcherRef} className={styles.launcher} aria-label="Open Shop Helper chat" onClick={() => setOpen(true)}><MessageCircle size={23} strokeWidth={2.2} />{unread && <span className={styles.unread} aria-label="Unread message" />}</button>}
-    {open && <section className={styles.panel} role="dialog" aria-modal="true" aria-labelledby="shop-helper-title">
+    {open && <section ref={panelRef} className={styles.panel} role="dialog" aria-modal="true" aria-labelledby="shop-helper-title">
       <header className={styles.header}>
         <span className={styles.avatar}><Bot size={19} /></span>
         <div className={styles.heading}><strong id="shop-helper-title">Shop Helper</strong><span><i />Online</span></div>
@@ -174,6 +188,7 @@ export default function ChatWidget() {
             <div className={`${styles.bubble} ${message.role === 'user' ? styles.userBubble : ''} ${message.failed ? styles.errorBubble : ''}`}>{message.content}</div>
             <time className={styles.time}>{index === 0 ? 'Just now' : message.time}</time>
             {message.failed && <button className={styles.retry} onClick={() => void send(message.retryText ?? '', true)} disabled={loading}>Retry</button>}
+            {!!message.actions?.length && <nav className={styles.assistantLinks} aria-label="Related store pages">{message.actions.map(action => <Link href={action.href} key={`${action.href}-${action.label}`}>{action.label}</Link>)}</nav>}
             {!!message.products?.length && <div className={styles.productList}>{message.products.map(product => <article className={styles.productCard} key={product.productId}>
               {product.imageUrl ? <img src={product.imageUrl} alt="" className={styles.productImage} /> : <span className={styles.productImageFallback}><ShoppingCart size={16} /></span>}
               <div className={styles.productInfo}><strong>{product.name}</strong><span>{formatINR(product.priceCents, product.currency)} · {product.city}</span></div>
@@ -196,7 +211,7 @@ export default function ChatWidget() {
         <label><input type="checkbox" checked={speakReplies} onChange={event => toggleSpeak(event.target.checked)} /><Volume2 size={14} />Speak replies</label>
         {speaking && <button type="button" onClick={() => { window.speechSynthesis.cancel(); setSpeaking(false) }}><Square size={12} />Stop</button>}
       </div>
-      <p className={styles.disclaimer}>AI assistant. It can make mistakes. For urgent issues, talk to a human.</p>
+      <p className={styles.disclaimer}>Product details reflect the listing; stock and delivery estimates can change.</p>
     </section>}
   </>
 }

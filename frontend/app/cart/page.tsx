@@ -31,7 +31,7 @@ export default function CartPage() {
       const product = products[index]?.data
       if (!product) return
       const stock = readStock(item.productId)
-      if (stock.inStock && stock.availableCount < item.quantity) setAdjustedStock(current => current[item.productId] === stock.availableCount ? current : { ...current, [item.productId]: stock.availableCount })
+      if (stock.availableCount < item.quantity) setAdjustedStock(current => current[item.productId] === stock.availableCount ? current : { ...current, [item.productId]: stock.availableCount })
       updateAvailability(item.productId, stock.inStock ? stock.availableCount : 0)
     })
   }, [items, products, readStock, updateAvailability])
@@ -56,7 +56,7 @@ export default function CartPage() {
         <div className="flex flex-wrap items-center gap-2"><StockBadge availableCount={stock.availableCount} inStock={stock.inStock} highlighted={stock.highlighted} />{outOfStock && <span className="text-xs text-muted-foreground">Remove to continue</span>}</div>
         <ExpiryIndicator expiryDate={fresh?.expiry_date} showExpired />
         {expired && <p className="quantity-notice" role="status">This item has expired and can&apos;t be checked out.</p>}
-        {reduced && <p className="quantity-notice" role="status">Quantity adjusted to {adjustedStock[item.productId]} because stock changed</p>}
+        {reduced && <p className="quantity-notice" role="status">{adjustedStock[item.productId] === 0 ? 'Stock is now unavailable. Remove this item to continue.' : `Quantity adjusted to ${adjustedStock[item.productId]} because stock changed.`}</p>}
         {refresh?.isError && <p className="refresh-error">Could not refresh availability</p>}
         <div className="cart-item-bottom"><div className="quantity-control" aria-label={`Quantity for ${item.name}`}><button aria-label="Decrease quantity" onClick={() => { setQuantity(item.productId, item.quantity - 1); setAdjustedStock(current => { const next = { ...current }; delete next[item.productId]; return next }) }} disabled={item.quantity <= 1}><Minus size={15} /></button><span>{item.quantity}</span><button aria-label="Increase quantity" onClick={() => setQuantity(item.productId, item.quantity + 1)} disabled={item.quantity >= maxQuantity || outOfStock || expired}><Plus size={15} /></button></div><strong className="line-total">{formatINR(item.priceCents * item.quantity, item.currency)}</strong></div></div></article>
     })}</section>

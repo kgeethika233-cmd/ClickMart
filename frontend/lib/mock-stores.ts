@@ -155,10 +155,8 @@ export function buildMockStoreComparisons(
   addBadge(byDistance[0]?.storeId, 'Nearest')
   addBadge(byEta[0]?.storeId, 'Fastest')
 
-  const fees = new Set(deliverable.map(store => store.deliveryFee))
-  if (fees.size > 1) {
-    addBadge([...deliverable].sort((a, b) => (a.deliveryFee ?? 0) - (b.deliveryFee ?? 0) || a.storeId.localeCompare(b.storeId))[0]?.storeId, 'Lowest fee')
-  }
+  const lowestFee = Math.min(...deliverable.map(store => store.deliveryFee ?? Number.POSITIVE_INFINITY))
+  deliverable.filter(store => store.deliveryFee === lowestFee).forEach(store => addBadge(store.storeId, 'Lowest fee'))
 
   const completeBaskets = deliverable.filter(store => store.inStockCount === store.totalCount && store.unavailableItems.length === 0)
   addBadge([...completeBaskets].sort((a, b) => (a.total ?? 0) - (b.total ?? 0) || (a.etaMinutes ?? 0) - (b.etaMinutes ?? 0) || a.storeId.localeCompare(b.storeId))[0]?.storeId, 'Best value')
