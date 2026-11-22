@@ -24,7 +24,11 @@ async function main() {
 
   // 1. Health check
   await runCheck('GET /api/health returns 200 and contractVersion 1.0.0', async () => {
-    const res = await fetch(`${BASE_URL}/api/health`);
+    let res = await fetch(`${BASE_URL}/api/health`);
+    if (res.status !== 200) {
+      await new Promise((r) => setTimeout(r, 1000));
+      res = await fetch(`${BASE_URL}/api/health`);
+    }
     if (res.status !== 200) throw new Error(`Status was ${res.status}`);
     const data = await res.json();
     if (data.contractVersion !== '1.0.0') throw new Error(`contractVersion was ${data.contractVersion}`);

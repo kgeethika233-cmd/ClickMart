@@ -40,3 +40,4 @@ export function clearCartStorage(): void {
     console.error('Failed to clear cart in localStorage', err);
   }
 }
+

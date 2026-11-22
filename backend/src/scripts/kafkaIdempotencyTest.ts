@@ -10,7 +10,8 @@ async function main() {
   const client = await pool.connect();
   let productId = 0;
   try {
-    const { rows } = await client.query("SELECT id FROM products WHERE sku = 'ELEC-CBL-005'");
+    const { rows } = await client.query("SELECT id FROM products WHERE sku = 'IH-001'");
+    if (!rows.length) throw new Error('Product IH-001 not found');
     productId = rows[0].id;
     // Set stock to 20, reserved 0
     await client.query('UPDATE inventory SET stock_count = 20, reserved_count = 0 WHERE product_id = $1', [productId]);

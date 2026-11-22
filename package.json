@@ -10,7 +10,10 @@
     "contract:check": "npm --prefix backend run contract:check",
     "test:concurrency": "npm --prefix backend run test:concurrency",
     "test:walkthrough": "npm --prefix backend run test:walkthrough",
+    "test:voice": "npm --prefix backend run test:voice",
+    "check:images": "npm --prefix backend run check:images",
     "demo:evidence": "npm --prefix backend run demo:evidence",
+    "test:acceptance": "npm --prefix backend run test:acceptance",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

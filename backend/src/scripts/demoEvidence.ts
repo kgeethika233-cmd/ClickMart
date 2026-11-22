@@ -29,6 +29,10 @@ async function main() {
 
   // 3. PostgreSQL Transactional Stock & Outbox Event
   console.log('\n3️⃣  POSTGRESQL ROW LOCKING & OUTBOX EVENT CREATION:');
+  const { rows: prodRows } = await pool.query(
+    'SELECT p.id, p.name FROM products p JOIN inventory i ON p.id = i.product_id WHERE p.is_active = true AND i.stock_count > 5 LIMIT 1'
+  );
+  const targetProductId = prodRows[0]?.id || 33;
   const testEmail = `judge-demo@retailhub.in`;
   const orderRes = await fetch(`${BASE_URL}/api/orders`, {
     method: 'POST',
@@ -37,7 +41,7 @@ async function main() {
       customerEmail: testEmail,
       customerName: 'Hackathon Judge',
       idempotencyKey: `judge-${Date.now()}`,
-      items: [{ productId: 1, quantity: 1 }],
+      items: [{ productId: targetProductId, quantity: 1 }],
     }),
   });
   const orderData = await orderRes.json();
@@ -70,9 +74,9 @@ async function main() {
 
   // 5. OpenSearch Live Stock Sync
   console.log('\n5️⃣  OPENSEARCH REAL-TIME SYNC:');
-  const osCheck = await opensearch.get({ index: 'products', id: '1' }).catch(() => null);
+  const osCheck = await opensearch.get({ index: 'products', id: String(targetProductId) }).catch(() => null);
   const osSource = (osCheck?.body || osCheck)?._source;
-  console.log(`OpenSearch Product #1 indexed stock: ${osSource?.stock_count} units (in_stock: ${osSource?.in_stock})`);
+  console.log(`OpenSearch Product #${targetProductId} indexed stock: ${osSource?.stock_count} units (in_stock: ${osSource?.in_stock})`);
 
   console.log('\n======================================================');
   console.log('🎉 ALL THREE AIVEN CLOUD SERVICES FULLY VERIFIED!');

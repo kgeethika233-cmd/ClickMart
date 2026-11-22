@@ -5,3 +5,4 @@ export function formatINR(cents: number, currency = 'INR'): string {
     maximumFractionDigits: 2,
   }).format(cents / 100);
 }
+

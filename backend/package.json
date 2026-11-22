@@ -19,8 +19,11 @@
     "test:concurrency": "tsx src/scripts/concurrencyTest.ts",
     "test:kafka:idempotency": "tsx src/scripts/kafkaIdempotencyTest.ts",
     "test:walkthrough": "tsx src/scripts/browserWalkthrough.ts",
+    "test:voice": "tsx src/scripts/voiceTest.ts",
+    "check:images": "tsx src/scripts/checkImages.ts",
     "contract:check": "tsx src/scripts/contractCheck.ts",
     "demo:evidence": "tsx src/scripts/demoEvidence.ts",
+    "test:acceptance": "tsx src/scripts/acceptanceRunner.ts",
     "test": "vitest run"
   },
   "dependencies": {

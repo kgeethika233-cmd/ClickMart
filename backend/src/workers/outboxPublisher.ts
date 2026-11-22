@@ -39,7 +39,7 @@ async function run() {
 
       if (events.length > 0) {
         for (const ev of events) {
-          await producer.send({
+          const sendResult = await producer.send({
             topic: ev.topic,
             acks: -1,
             messages: [
@@ -50,9 +50,12 @@ async function run() {
             ],
           });
 
+          const partition = sendResult[0]?.partition ?? 0;
+          const offset = String(sendResult[0]?.offset ?? '0');
+
           await client.query(
-            'UPDATE outbox_events SET published_at = NOW() WHERE id = $1',
-            [ev.id]
+            'UPDATE outbox_events SET published_at = NOW(), kafka_partition = $2, kafka_offset = $3 WHERE id = $1',
+            [ev.id, partition, offset]
           );
         }
 

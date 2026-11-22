@@ -20,3 +20,4 @@ export function generateId(): string {
     return v.toString(16);
   });
 }
+

@@ -160,3 +160,4 @@ export async function getHealth(): Promise<HealthResponse> {
   const { data } = await request<HealthResponse>('/api/health');
   return data;
 }
+

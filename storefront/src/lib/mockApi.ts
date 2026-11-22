@@ -286,3 +286,4 @@ export async function mockGetHealth(): Promise<HealthResponse> {
     contractVersion: CONTRACT_VERSION,
   };
 }
+

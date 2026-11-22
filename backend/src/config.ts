@@ -9,6 +9,7 @@ const envSchema = z.object({
   API_PORT: z.coerce.number().default(4000),
   CORS_ORIGINS: z.string().default('http://localhost:3000,http://127.0.0.1:3000'),
   ADMIN_KEY: z.string().default('dev-secret-admin-key-123'),
+  IMAGE_BASE_URL: z.string().default('http://localhost:4000/images'),
 
   PG_HOST: z.string().min(1, 'PG_HOST is required'),
   PG_PORT: z.coerce.number().default(5432),

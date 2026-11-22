@@ -113,8 +113,10 @@ async function main() {
     // -------------------------------------------------------------------------
     // Step 4: Product Detail Page & Live Stock
     // -------------------------------------------------------------------------
-    console.log('Step 4: Checking product detail page for Product #1...');
-    await page.goto('http://localhost:3000/product/1', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    const { rows: speakerRows } = await pool.query("SELECT id FROM products WHERE sku = 'IH-001'");
+    const speakerId = speakerRows[0]?.id || 33;
+    console.log(`Step 4: Checking product detail page for Product #${speakerId} (Bluetooth Speaker)...`);
+    await page.goto(`http://localhost:3000/product/${speakerId}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await new Promise((r) => setTimeout(r, 4000));
 
     const productDetailResult = await page.evaluate(() => {

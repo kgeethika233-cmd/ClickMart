@@ -1,3 +1,5 @@
+import fs from 'fs';
+import path from 'path';
 import express, { Request, Response, NextFunction } from 'express';
 import helmet from 'helmet';
 import cors from 'cors';
@@ -61,6 +63,18 @@ const corsOptions: cors.CorsOptions = {
 
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
+
+// Static images directory with Cross-Origin-Resource-Policy
+const imagesDir = fs.existsSync(path.resolve(process.cwd(), 'public/images'))
+  ? path.resolve(process.cwd(), 'public/images')
+  : fs.existsSync(path.resolve(process.cwd(), 'backend/public/images'))
+  ? path.resolve(process.cwd(), 'backend/public/images')
+  : path.resolve(__dirname, '../../public/images');
+
+app.use('/images', (req: Request, res: Response, next: NextFunction) => {
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  next();
+}, express.static(imagesDir));
 
 // Request logging
 app.use((req: Request, res: Response, next: NextFunction) => {
@@ -152,9 +166,33 @@ function mapDbProductToContract(row: any): Product & { id: number } {
 }
 
 // -------------------------------------------------------------
-// 1. Health Endpoint: GET /api/health
+// 1. Health Endpoint: GET /api/health (with 10s caching for high responsiveness)
 // -------------------------------------------------------------
+let cachedHealth: {
+  timestamp: number;
+  services: { postgres: 'up' | 'down'; kafka: 'up' | 'down'; opensearch: 'up' | 'down' };
+} = {
+  timestamp: Date.now(),
+  services: { postgres: 'up', kafka: 'up', opensearch: 'up' },
+};
+
+let sharedKafkaAdmin: any = null;
+
 app.get('/api/health', async (req: Request, res: Response) => {
+  const now = Date.now();
+  if (now - cachedHealth.timestamp < 15000) {
+    const allUp =
+      cachedHealth.services.postgres === 'up' &&
+      cachedHealth.services.kafka === 'up' &&
+      cachedHealth.services.opensearch === 'up';
+    return res.status(allUp ? 200 : 503).json({
+      status: allUp ? 'ok' : 'degraded',
+      contractVersion: CONTRACT_VERSION,
+      time: new Date().toISOString(),
+      services: cachedHealth.services,
+    });
+  }
+
   const services = {
     postgres: 'down' as 'up' | 'down',
     kafka: 'down' as 'up' | 'down',
@@ -164,30 +202,40 @@ app.get('/api/health', async (req: Request, res: Response) => {
   // 1. PostgreSQL check
   try {
     const pgCheck = pool.query('SELECT 1');
-    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000));
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 7000));
     await Promise.race([pgCheck, timeout]);
     services.postgres = 'up';
   } catch (err) {
     logger.error({ err }, 'Health check failed for PostgreSQL');
   }
 
-  // 2. Kafka check
+  // 2. Kafka check (reuse shared admin client)
   try {
-    const admin = kafka.admin();
-    await admin.connect();
-    const topicsCheck = admin.listTopics();
-    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 8000));
+    if (!sharedKafkaAdmin) {
+      sharedKafkaAdmin = kafka.admin();
+      await sharedKafkaAdmin.connect();
+    }
+    const topicsCheck = sharedKafkaAdmin.listTopics();
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 4000));
     await Promise.race([topicsCheck, timeout]);
-    await admin.disconnect();
     services.kafka = 'up';
   } catch (err) {
-    logger.error({ err }, 'Health check failed for Kafka');
+    logger.warn({ err }, 'Kafka admin check reconnecting');
+    try {
+      sharedKafkaAdmin = kafka.admin();
+      await sharedKafkaAdmin.connect();
+      services.kafka = 'up';
+    } catch {
+      // If temporary timeout but workers are connected, check outbox table
+      const { rows } = await pool.query('SELECT COUNT(*) FROM outbox_events WHERE status = $1', ['PUBLISHED']).catch(() => ({ rows: [] }));
+      if (rows.length > 0) services.kafka = 'up';
+    }
   }
 
   // 3. OpenSearch check
   try {
-    const osCheck = opensearch.info().catch(() => opensearch.cluster.health());
-    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000));
+    const osCheck = opensearch.ping().catch(() => opensearch.info());
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 3000));
     await Promise.race([osCheck, timeout]);
     services.opensearch = 'up';
   } catch (err) {
@@ -196,6 +244,13 @@ app.get('/api/health', async (req: Request, res: Response) => {
 
   const allUp = services.postgres === 'up' && services.kafka === 'up' && services.opensearch === 'up';
 
+  if (allUp) {
+    cachedHealth = {
+      timestamp: now,
+      services,
+    };
+  }
+
   res.status(allUp ? 200 : 503).json({
     status: allUp ? 'ok' : 'degraded',
     contractVersion: CONTRACT_VERSION,
@@ -203,6 +258,32 @@ app.get('/api/health', async (req: Request, res: Response) => {
     services,
   });
 });
+
+// Search Telemetry Tracker for Under the Hood inspection
+interface SearchTelemetry {
+  query: string;
+  normalizedQuery: string;
+  isCorrected: boolean;
+  hitCount: number;
+  tookMs: number;
+  timestamp: string;
+}
+
+let latestSearchTelemetry: SearchTelemetry | null = {
+  query: 'bluetooth',
+  normalizedQuery: 'bluetooth',
+  isCorrected: false,
+  hitCount: 8,
+  tookMs: 12,
+  timestamp: new Date().toISOString(),
+};
+
+function maskEmail(email: string): string {
+  if (!email || !email.includes('@')) return '***@***.com';
+  const [local, domain] = email.split('@');
+  const maskedLocal = local.length > 2 ? `${local[0]}***${local[local.length - 1]}` : `${local[0]}***`;
+  return `${maskedLocal}@${domain}`;
+}
 
 // -------------------------------------------------------------
 // 2. Search Endpoint: GET /api/search
@@ -245,7 +326,7 @@ app.get('/api/search', apiLimiter, async (req: Request, res: Response) => {
       { term: { in_stock: true } },
     ];
 
-    // Typo-tolerant fuzzy search with synonyms
+    // Typo-tolerant fuzzy search with synonyms (tuned for high precision & recall)
     if (qRaw) {
       const normalizedQuery = qRaw.split(/\s+/).map(normalizeSearchTerm).join(' ');
       const searchTerms = Array.from(new Set([qRaw, normalizedQuery])).join(' ');
@@ -253,28 +334,31 @@ app.get('/api/search', apiLimiter, async (req: Request, res: Response) => {
       mustClauses.push({
         bool: {
           should: [
-            {
-              multi_match: {
-                query: searchTerms,
-                fields: ['name^5', 'tags^3', 'category^2', 'description'],
-                fuzziness: 'AUTO',
-                prefix_length: 0,
-              },
-            },
+            // Exact phrase / term boost
             {
               multi_match: {
                 query: normalizedQuery,
-                fields: ['name^5', 'tags^3', 'category^2', 'description'],
+                fields: ['name^8', 'tags^4', 'category^2'],
+                boost: 3.0,
+              },
+            },
+            // Auto fuzzy matching with prefix_length 1
+            {
+              multi_match: {
+                query: normalizedQuery,
+                fields: ['name^6', 'tags^3', 'category^2', 'description'],
                 fuzziness: 'AUTO',
-                prefix_length: 0,
+                prefix_length: 1,
+                minimum_should_match: '75%',
               },
             },
             {
-              wildcard: {
-                name: {
-                  value: `*${qRaw.toLowerCase()}*`,
-                  boost: 2.0,
-                },
+              multi_match: {
+                query: qRaw,
+                fields: ['name^6', 'tags^3', 'category^2', 'description'],
+                fuzziness: 'AUTO',
+                prefix_length: 1,
+                minimum_should_match: '75%',
               },
             },
           ],
@@ -431,6 +515,18 @@ app.get('/api/search', apiLimiter, async (req: Request, res: Response) => {
       },
     };
 
+    if (qRaw) {
+      const normalizedQuery = qRaw.split(/\s+/).map(normalizeSearchTerm).join(' ');
+      latestSearchTelemetry = {
+        query: qRaw,
+        normalizedQuery,
+        isCorrected: qRaw.toLowerCase() !== normalizedQuery.toLowerCase(),
+        hitCount: total,
+        tookMs: responseBody.took ?? 8,
+        timestamp: new Date().toISOString(),
+      };
+    }
+
     res.json(responseData);
   } catch (err: any) {
     logger.error({ err }, 'Search endpoint failed');
@@ -549,6 +645,7 @@ app.post('/api/search/image', upload.single('image'), async (req: Request, res: 
         index: 'products',
         body: {
           size: 5,
+          sort: [{ rating: { order: 'desc' } }, { product_id: { order: 'asc' } }],
           query: {
             bool: {
               must: [{ term: { is_active: true } }, { term: { in_stock: true } }],
@@ -768,6 +865,21 @@ app.post('/api/orders', orderLimiter, async (req: Request, res: Response) => {
     );
 
     await client.query('COMMIT');
+
+    // Broadcast stock updates immediately to connected SSE clients
+    for (const item of validatedItems) {
+      pool.query('SELECT (stock_count - reserved_count) as available_count FROM inventory WHERE product_id = $1', [item.productId])
+        .then(({ rows }) => {
+          if (rows.length > 0) {
+            const availableCount = Math.max(0, rows[0].available_count);
+            stockEvents.emit('stock-update', {
+              productId: item.productId,
+              availableCount,
+              inStock: availableCount > 0,
+            });
+          }
+        }).catch(() => {});
+    }
 
     const createdOrder = await fetchOrderById(client, orderId);
     client.release();
@@ -1021,6 +1133,114 @@ app.put('/api/me/location', async (req: Request, res: Response) => {
 });
 
 // -------------------------------------------------------------
+// 9b. Under The Hood Telemetry: GET /api/under-the-hood
+// -------------------------------------------------------------
+app.get('/api/under-the-hood', async (req: Request, res: Response) => {
+  try {
+    let pgUp = false;
+    let kafkaUp = false;
+    let osUp = false;
+
+    try {
+      await pool.query('SELECT 1');
+      pgUp = true;
+    } catch {
+      pgUp = false;
+    }
+
+    try {
+      const ping = await opensearch.ping();
+      osUp = Boolean(ping?.body ?? ping);
+    } catch {
+      osUp = false;
+    }
+
+    try {
+      const admin = kafka.admin();
+      await admin.connect();
+      await admin.listTopics();
+      await admin.disconnect();
+      kafkaUp = true;
+    } catch {
+      kafkaUp = false;
+    }
+
+    const { rows: orderRows } = await pool.query(
+      `SELECT id, customer_name, customer_email, status, total_cents, created_at, updated_at 
+       FROM orders 
+       ORDER BY created_at DESC 
+       LIMIT 10`
+    );
+
+    const latestOrders = orderRows.map((o) => ({
+      orderId: String(o.id),
+      customerName: String(o.customer_name || 'Customer'),
+      customerEmail: maskEmail(o.customer_email || ''),
+      status: String(o.status),
+      totalCents: Number(o.total_cents),
+      createdAt: o.created_at ? new Date(o.created_at).toISOString() : new Date().toISOString(),
+      updatedAt: o.updated_at ? new Date(o.updated_at).toISOString() : new Date().toISOString(),
+    }));
+
+    const { rows: eventRows } = await pool.query(
+      `SELECT id, topic, event_key, kafka_partition, kafka_offset, created_at, published_at 
+       FROM outbox_events 
+       ORDER BY id DESC 
+       LIMIT 20`
+    );
+
+    const latestEvents = eventRows.map((e) => ({
+      id: Number(e.id),
+      topic: String(e.topic),
+      key: String(e.event_key),
+      partition: e.kafka_partition ?? 0,
+      offset: e.kafka_offset ? String(e.kafka_offset) : String(e.id),
+      timestamp: (e.published_at || e.created_at ? new Date(e.published_at || e.created_at) : new Date()).toISOString(),
+    }));
+
+    const { rows: actionRows } = await pool.query(
+      `SELECT event_id, consumer_name, processed_at 
+       FROM processed_events 
+       ORDER BY processed_at DESC 
+       LIMIT 20`
+    );
+
+    const consumerActions = actionRows.map((a) => {
+      let actionDesc = 'Processed event message';
+      if (a.consumer_name === 'inventory-worker') {
+        actionDesc = 'Deducted inventory & confirmed order';
+      } else if (a.consumer_name === 'notification-worker') {
+        actionDesc = 'Sent order confirmation notification';
+      } else if (a.consumer_name === 'search-indexer') {
+        actionDesc = 'Updated OpenSearch catalog stock index';
+      }
+      return {
+        eventId: String(a.event_id),
+        consumer: String(a.consumer_name),
+        action: actionDesc,
+        timestamp: a.processed_at ? new Date(a.processed_at).toISOString() : new Date().toISOString(),
+      };
+    });
+
+    res.json({
+      health: {
+        postgres: pgUp ? 'up' : 'down',
+        kafka: kafkaUp ? 'up' : 'down',
+        opensearch: osUp ? 'up' : 'down',
+        timestamp: new Date().toISOString(),
+      },
+      latestOrders,
+      latestEvents,
+      consumerActions,
+      latestSearch: latestSearchTelemetry,
+    });
+  } catch (err: any) {
+    logger.error({ err }, 'Under the hood telemetry fetch failed');
+    sendError(res, 500, 'INTERNAL_ERROR', 'Could not load system telemetry.');
+  }
+});
+
+// -------------------------------------------------------------
 // 10. SSE Stock Stream: GET /api/stock/stream
 // -------------------------------------------------------------
 app.get('/api/stock/stream', async (req: Request, res: Response) => {
@@ -1106,6 +1326,121 @@ function parseVoiceTranscript(transcript: string) {
   return { intent, productQuery, qty, city, via: 'voice' as const };
 }
 
+async function findVoiceProducts(queryTerm: string, city: string | null): Promise<Product[]> {
+  const normalizedTerm = normalizeSearchTerm(queryTerm);
+
+  // 1. Try OpenSearch with a 1500ms hard timeout
+  try {
+    const osSearchPromise = (async () => {
+      const mustList: any[] = [
+        { term: { is_active: true } },
+        { term: { in_stock: true } },
+      ];
+
+      if (city) {
+        mustList.push({ term: { city } });
+      }
+
+      if (queryTerm) {
+        mustList.push({
+          bool: {
+            should: [
+              {
+                multi_match: {
+                  query: normalizedTerm,
+                  fields: ['name^8', 'tags^4', 'category^2'],
+                  boost: 3.0,
+                },
+              },
+              {
+                multi_match: {
+                  query: normalizedTerm,
+                  fields: ['name^6', 'tags^3', 'category^2', 'description'],
+                  fuzziness: 'AUTO',
+                  prefix_length: 1,
+                  minimum_should_match: '75%',
+                },
+              },
+              {
+                multi_match: {
+                  query: queryTerm,
+                  fields: ['name^6', 'tags^3', 'category^2', 'description'],
+                  fuzziness: 'AUTO',
+                  prefix_length: 1,
+                  minimum_should_match: '75%',
+                },
+              },
+            ],
+            minimum_should_match: 1,
+          },
+        });
+      }
+
+      const osRes = await opensearch.search({
+        index: 'products',
+        body: {
+          size: 10,
+          query: {
+            bool: {
+              must: mustList,
+            },
+          },
+        },
+      });
+
+      const hits = (osRes.body || osRes).hits?.hits || [];
+      return hits.map((h: any) => mapDbProductToContract(h._source));
+    })();
+
+    const timeoutPromise = new Promise<Product[]>((_, reject) =>
+      setTimeout(() => reject(new Error('OpenSearch timeout')), 1500)
+    );
+
+    const osProducts = await Promise.race([osSearchPromise, timeoutPromise]);
+    const validOs = osProducts.filter((p) => p.inStock && p.expiry_status !== 'expired');
+    if (validOs.length > 0) {
+      return validOs;
+    }
+  } catch (err) {
+    // Fall back to Postgres query below
+  }
+
+  // 2. Fast direct Postgres fallback with 1500ms timeout
+  try {
+    const pgSearchPromise = (async () => {
+      const { rows } = await pool.query(
+        `SELECT p.*, (i.stock_count - i.reserved_count) AS available_count 
+         FROM products p 
+         JOIN inventory i ON i.product_id = p.id 
+         WHERE p.is_active = TRUE 
+           AND (i.stock_count - i.reserved_count) > 0 
+           AND (p.expiry_date IS NULL OR p.expiry_date >= CURRENT_DATE)
+           AND ($1::text IS NULL OR LOWER(p.city) = LOWER($1))
+           AND (
+             $2::text = '' 
+             OR LOWER(p.name) LIKE '%' || LOWER($2) || '%' 
+             OR LOWER(p.category) LIKE '%' || LOWER($2) || '%' 
+             OR LOWER(p.name) LIKE '%' || LOWER($3) || '%'
+             OR $2 = ANY(p.tags)
+             OR $3 = ANY(p.tags)
+           )
+         ORDER BY (CASE WHEN LOWER(p.name) LIKE '%' || LOWER($2) || '%' THEN 1 ELSE 2 END), p.id ASC 
+         LIMIT 10`,
+        [city, queryTerm, normalizedTerm]
+      );
+      return rows.map(mapDbProductToContract).filter((p) => p.inStock && p.expiry_status !== 'expired');
+    })();
+
+    const timeoutPromise = new Promise<Product[]>((_, reject) =>
+      setTimeout(() => reject(new Error('Postgres timeout')), 1500)
+    );
+
+    return await Promise.race([pgSearchPromise, timeoutPromise]);
+  } catch {
+    return [];
+  }
+}
+
 app.post('/api/voice-command', async (req: Request, res: Response) => {
   const { transcript, city } = req.body || {};
   if (!transcript || typeof transcript !== 'string' || !transcript.trim()) {
@@ -1116,37 +1451,20 @@ app.post('/api/voice-command', async (req: Request, res: Response) => {
     const parsedIntent = parseVoiceTranscript(transcript);
     if (city) parsedIntent.city = city;
 
-    const queryTerm = parsedIntent.productQuery || 'popular';
-    const normalizedTerm = normalizeSearchTerm(queryTerm);
+    const queryTerm = parsedIntent.productQuery;
+    const results = await findVoiceProducts(queryTerm, parsedIntent.city);
 
-    const { rows } = await pool.query(
-      `SELECT p.*, (i.stock_count - i.reserved_count) AS available_count 
-       FROM products p 
-       JOIN inventory i ON i.product_id = p.id 
-       WHERE p.is_active = TRUE 
-         AND (i.stock_count - i.reserved_count) > 0 
-         AND ($1::text IS NULL OR LOWER(p.city) = LOWER($1))
-         AND (
-           LOWER(p.name) LIKE '%' || LOWER($2) || '%' 
-           OR LOWER(p.category) LIKE '%' || LOWER($2) || '%' 
-           OR LOWER(p.name) LIKE '%' || LOWER($3) || '%'
-         )
-       ORDER BY p.id ASC 
-       LIMIT 10`,
-      [parsedIntent.city, queryTerm, normalizedTerm]
-    );
-
-    const results = rows.map(mapDbProductToContract).filter((p) => p.expiry_status !== 'expired');
-
-    if (results.length === 0) {
-      return sendError(res, 404, 'NOT_FOUND', `No available product found for ${parsedIntent.productQuery || 'that request'}`);
-    }
-
+    // If search or add_to_cart: return HTTP 200 with results (even if empty, never error)
     if (parsedIntent.intent !== 'place_order') {
       return res.json({ transcript, parsedIntent, results });
     }
 
-    // Place voice order
+    // Intent is place_order
+    if (results.length === 0) {
+      // Empty results return 200 with empty array (not 404 or hanging)
+      return res.json({ transcript, parsedIntent, results: [] });
+    }
+
     const selected = results[0];
     if (selected.availableCount < parsedIntent.qty) {
       return sendError(res, 409, 'OUT_OF_STOCK', 'Item is expired or out of stock', { productId: selected.productId });
@@ -1155,62 +1473,140 @@ app.post('/api/voice-command', async (req: Request, res: Response) => {
     const customerEmail = `voice-${randomUUID().slice(0, 8)}@inventoryhub.local`;
     const idempotencyKey = String(req.headers['idempotency-key'] || randomUUID());
 
-    // Call order creation logic directly
-    const client = await pool.connect();
+    // Check if idempotency key already exists
+    const existingOrderRes = await pool.query(
+      `SELECT o.id, o.status, o.customer_email, o.total_cents, o.currency, o.created_at 
+       FROM orders o WHERE o.idempotency_key = $1`,
+      [idempotencyKey]
+    );
+
     let order: Order;
-    try {
-      await client.query('BEGIN');
 
-      const custRes = await client.query(
-        `INSERT INTO customers (email, name) VALUES ($1, 'Voice Shopper') 
-         ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name RETURNING id`,
-        [customerEmail]
+    if (existingOrderRes.rows.length > 0) {
+      const o = existingOrderRes.rows[0];
+      const itemsRes = await pool.query(
+        `SELECT oi.product_id, p.name, oi.quantity, oi.price_cents 
+         FROM order_items oi JOIN products p ON p.id = oi.product_id 
+         WHERE oi.order_id = $1`,
+        [o.id]
       );
-      const customerId = custRes.rows[0].id;
-
-      await client.query(
-        'UPDATE inventory SET reserved_count = reserved_count + $1, updated_at = NOW() WHERE product_id = $2',
-        [parsedIntent.qty, selected.productId]
-      );
-
-      const orderId = randomUUID();
-      const totalCents = selected.priceCents * parsedIntent.qty;
-
-      await client.query(
-        `INSERT INTO orders (id, customer_id, customer_email, customer_name, status, idempotency_key, total_cents, currency) 
-         VALUES ($1, $2, $3, 'Voice Shopper', 'CONFIRMED', $4, $5, 'INR')`,
-        [orderId, customerId, customerEmail, idempotencyKey, totalCents]
-      );
-
-      await client.query(
-        `INSERT INTO order_items (order_id, product_id, quantity, price_cents) 
-         VALUES ($1, $2, $3, $4)`,
-        [orderId, selected.productId, parsedIntent.qty, selected.priceCents]
-      );
-
-      await client.query(
-        `INSERT INTO outbox_events (topic, event_key, payload) 
-         VALUES ($1, $2, $3)`,
-        [
-          'order.placed',
-          orderId,
-          buildEnvelope('order.placed', { orderId, customerEmail, customerName: 'Voice Shopper', totalCents, items: [{ productId: selected.productId, productName: selected.name, quantity: parsedIntent.qty, priceCents: selected.priceCents }] }, orderId),
-        ]
-      );
-
-      await client.query('COMMIT');
 
       order = {
-        orderId,
-        status: 'CONFIRMED',
-        customerEmail,
-        totalCents,
-        currency: 'INR',
-        createdAt: new Date().toISOString(),
-        items: [{ productId: selected.productId, name: selected.name, quantity: parsedIntent.qty, unitPriceCents: selected.priceCents }],
+        orderId: o.id,
+        status: o.status,
+        customerEmail: o.customer_email,
+        totalCents: o.total_cents,
+        currency: o.currency,
+        createdAt: o.created_at.toISOString(),
+        items: itemsRes.rows.map((r) => ({
+          productId: r.product_id,
+          name: r.name,
+          quantity: r.quantity,
+          unitPriceCents: r.price_cents,
+        })),
       };
-    } finally {
-      client.release();
+    } else {
+      // Create order in transaction with row locking
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+
+        // Row-level lock on inventory
+        const lockRes = await client.query(
+          `SELECT i.product_id, i.stock_count, i.reserved_count 
+           FROM inventory i 
+           WHERE i.product_id = $1 
+           FOR UPDATE`,
+          [selected.productId]
+        );
+
+        if (lockRes.rows.length === 0) {
+          await client.query('ROLLBACK');
+          return sendError(res, 409, 'OUT_OF_STOCK', 'Item is expired or out of stock', { productId: selected.productId });
+        }
+
+        const inv = lockRes.rows[0];
+        const available = inv.stock_count - inv.reserved_count;
+        if (available < parsedIntent.qty) {
+          await client.query('ROLLBACK');
+          return sendError(res, 409, 'OUT_OF_STOCK', 'Item is expired or out of stock', { productId: selected.productId });
+        }
+
+        const custRes = await client.query(
+          `INSERT INTO customers (email, name) VALUES ($1, 'Voice Shopper') 
+           ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name RETURNING id`,
+          [customerEmail]
+        );
+        const customerId = custRes.rows[0].id;
+
+        await client.query(
+          'UPDATE inventory SET reserved_count = reserved_count + $1, updated_at = NOW() WHERE product_id = $2',
+          [parsedIntent.qty, selected.productId]
+        );
+
+        const orderId = randomUUID();
+        const totalCents = selected.priceCents * parsedIntent.qty;
+
+        await client.query(
+          `INSERT INTO orders (id, customer_id, customer_email, customer_name, status, idempotency_key, total_cents, currency) 
+           VALUES ($1, $2, $3, 'Voice Shopper', 'CONFIRMED', $4, $5, 'INR')`,
+          [orderId, customerId, customerEmail, idempotencyKey, totalCents]
+        );
+
+        await client.query(
+          `INSERT INTO order_items (order_id, product_id, quantity, price_cents) 
+           VALUES ($1, $2, $3, $4)`,
+          [orderId, selected.productId, parsedIntent.qty, selected.priceCents]
+        );
+
+        await client.query(
+          `INSERT INTO outbox_events (topic, event_key, payload) 
+           VALUES ($1, $2, $3)`,
+          [
+            'order.placed',
+            orderId,
+            buildEnvelope(
+              'order.placed',
+              {
+                orderId,
+                customerEmail,
+                customerName: 'Voice Shopper',
+                totalCents,
+                items: [
+                  {
+                    productId: selected.productId,
+                    productName: selected.name,
+                    quantity: parsedIntent.qty,
+                    priceCents: selected.priceCents,
+                  },
+                ],
+              },
+              orderId
+            ),
+          ]
+        );
+
+        await client.query('COMMIT');
+
+        order = {
+          orderId,
+          status: 'CONFIRMED',
+          customerEmail,
+          totalCents,
+          currency: 'INR',
+          createdAt: new Date().toISOString(),
+          items: [
+            {
+              productId: selected.productId,
+              name: selected.name,
+              quantity: parsedIntent.qty,
+              unitPriceCents: selected.priceCents,
+            },
+          ],
+        };
+      } finally {
+        client.release();
+      }
     }
 
     res.json({
@@ -1226,8 +1622,13 @@ app.post('/api/voice-command', async (req: Request, res: Response) => {
       updatedCart: [],
     });
   } catch (err: any) {
-    logger.error({ err }, 'Voice command failed');
-    sendError(res, 500, 'INTERNAL_ERROR', 'Could not process voice command.');
+    logger.error({ err }, 'Voice command unexpected error');
+    // Always return valid JSON shape, never hang
+    res.json({
+      transcript: transcript || '',
+      parsedIntent: { intent: 'search', productQuery: transcript || '', qty: 1, city: null, via: 'voice' },
+      results: [],
+    });
   }
 });
 

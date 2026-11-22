@@ -1,4 +1,3 @@
-// AUTO-COPIED, DO NOT EDIT.
 /**
  * Contract Types for Inventory Hub
  * CONTRACT_VERSION: 1.0.0
