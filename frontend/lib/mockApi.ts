@@ -2,7 +2,7 @@ import { CONTRACT_VERSION, type Product, type SearchParams, type SearchResponse,
 import { ApiError } from './api'
 import { generateId } from './id'
 import { normalizeSearchTerm } from './mock-synonyms'
-import { decrementMockExpiryStock, mockExpiryProduct } from './mock-expiry'
+import { decrementMockExpiryStock, mockExpiryProduct, mockExpiryProducts } from './mock-expiry'
 
 const tuples:[string,string,string,number,number][]=[
  ['Bluetooth Speaker','Electronics','Bengaluru',1499,24],['Classic Cotton Tee','Fashion','Mumbai',699,18],['Ceramic Coffee Mug','Home','Delhi',349,20],['The Everyday Journal','Books','Chennai',499,16],['Yoga Mat','Sports','Hyderabad',899,12],['Bluetooth Headphones','Electronics','Mumbai',2499,15],['Canvas Tote Bag','Fashion','Delhi',599,32],['Wireless Earbuds','Electronics','Bengaluru',1999,14],
@@ -12,6 +12,7 @@ const latency=()=>new Promise<void>(r=>setTimeout(r,250))
 const orders=new Map<string,Order>(), keys=new Map<string,Order>(), reserved=new Map<number,number>()
 function settle(){for(const o of orders.values())if(o.status==='PLACED' && Date.now()-Date.parse(o.createdAt)>=3000){for(const i of o.items){if(i.productId>=1001)continue;const p=products[i.productId-1];p.availableCount-=i.quantity;p.inStock=p.availableCount>0;reserved.set(i.productId,(reserved.get(i.productId)??0)-i.quantity)}o.status='CONFIRMED'}}
 function available(p:Product){const availableCount=p.availableCount-(reserved.get(p.productId)??0);return {...p,availableCount,inStock:availableCount>0}}
+export async function listMockProducts():Promise<Product[]>{await latency();settle();const perishable=mockExpiryProducts.map(product=>mockExpiryProduct(product.productId)).filter((product):product is Product=>!!product);return [...products.map(available),...perishable]}
 function distance(a:string,b:string){let row=Array.from({length:b.length+1},(_,i)=>i);for(let i=0;i<a.length;i++){const next=[i+1];for(let j=0;j<b.length;j++)next.push(Math.min(row[j+1]+1,next[j]+1,row[j]+Number(a[i]!==b[j])));row=next}return row[b.length]}
 function match(q:string,w:string){const term=normalizeSearchTerm(q);if(term===w)return 5;if(w.startsWith(term))return 3;const d=term.length>=8?2:term.length>=4?1:0;return distance(term,w)<=d||distance(term.replaceAll('ph','f'),w.replaceAll('ph','f'))<=d?1:0}
 export async function searchProducts(params:SearchParams={}):Promise<SearchResponse>{await latency();settle();const words=params.q?.toLowerCase().trim().split(/\s+/).filter(Boolean)??[];

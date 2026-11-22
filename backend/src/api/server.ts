@@ -1633,169 +1633,111 @@ app.post('/api/voice-command', async (req: Request, res: Response) => {
 });
 
 // -------------------------------------------------------------
-// 12. Chat: POST /api/chat (Deterministic fallback mirroring mock-chat.ts)
+// 12. Chat: POST /api/chat (catalogue-grounded store assistant)
 // -------------------------------------------------------------
 app.post('/api/chat', async (req: Request, res: Response) => {
   const { messages, context } = req.body || {};
   const history = Array.isArray(messages) ? messages.slice(-20) : [];
-  const text = (history.at(-1)?.content || '').trim().toLowerCase();
-  const cityContext = context?.city || 'Bengaluru';
-  const cartProductIds: number[] = Array.isArray(context?.cartProductIds) ? context.cartProductIds : [];
-  const lastOrderId = context?.lastOrderId || null;
+  const rawText = typeof history.at(-1)?.content === 'string' ? history.at(-1).content.trim() : '';
+  const text = rawText.toLowerCase();
+  const cityContext = typeof context?.city === 'string' ? context.city : 'Bengaluru';
+  const cartProductIds: number[] = Array.isArray(context?.cartProductIds) ? context.cartProductIds.map(Number).filter(Number.isSafeInteger) : [];
+  const lastOrderId = typeof context?.lastOrderId === 'string' ? context.lastOrderId : null;
+  const link = (label: string, href: string) => ({ label, href });
+  const searchLink = link('Browse products', '/search');
+  const compareLink = link('Compare stores', '/compare');
+  const cartLink = link('View cart', '/cart');
+  const ordersLink = link('My orders', '/orders');
+  const stopWords = new Set('a an and are about best buy can could details do does find for from give have help i in is it me my of on please product products recommend show tell the this to want what which with under below less than up to available availability stock rating highest rated cheapest price cost item items you your sell catalog catalogue store stores inventory carry'.split(' '));
+  const aliases: Record<string, string> = { earphone: 'headphone', earphones: 'headphone', earbuds: 'headphone', airdopes: 'headphone', headphones: 'headphone', sandal: 'shoe', sandals: 'shoe', slipper: 'shoe', slippers: 'shoe', chappal: 'shoe', footwear: 'shoe', shoes: 'shoe', tshirt: 'tee', tshirts: 'tee', shirts: 'shirt' };
+  const termsFor = (value: string) => value.toLowerCase().replace(/₹/g, ' ').replace(/[^a-z0-9]+/g, ' ').split(/\s+/).map((term: string) => aliases[term] || term.replace(/s$/, '')).filter((term: string) => term.length > 1 && !stopWords.has(term) && !/^\d+$/.test(term));
+  const respond = (reply: string, actions: { label: string; href: string }[] = [], products?: unknown[]) => res.json({ reply, ...(products?.length ? { products } : {}), ...(actions.length ? { actions } : {}), via: 'fallback' });
+  const productDetails = (product: any, question: string) => {
+    const price = new Intl.NumberFormat('en-IN', { style: 'currency', currency: product.currency }).format(product.priceCents / 100);
+    const stock = product.inStock && product.availableCount > 0 ? `${product.availableCount} in stock` : 'currently out of stock';
+    const facts = [product.description, `Price: ${price}.`, `Category: ${product.category}. Listed in ${product.city}.`, `SKU: ${product.sku}.`, `Availability: ${stock}.`];
+    if (product.rating) facts.push(`Rating: ${product.rating} out of 5.`);
+    if (product.delivery_time_mins != null) facts.push(`Listed delivery estimate: about ${product.delivery_time_mins} minutes${product.delivery_fee != null ? `, with a ${new Intl.NumberFormat('en-IN', { style: 'currency', currency: product.currency }).format(product.delivery_fee)} delivery fee` : ''}.`);
+    if (product.expiry_status && product.expiry_status !== 'none' && product.days_to_expiry != null) facts.push(`Expiry: ${product.days_to_expiry} ${product.days_to_expiry === 1 ? 'day' : 'days'} remaining (${product.expiry_status.replace('_', ' ')}).`);
+    const requestedSpec = question.match(/\b(waterproof|water resistant|battery|material|color|colour|size|dimensions|capacity|warranty|compatibility|weight|washable|ingredients?)\b/i)?.[0];
+    const listedInfo = `${product.name} ${product.description} ${(product.tags || []).join(' ')}`.toLowerCase();
+    const caveat = requestedSpec && !listedInfo.includes(requestedSpec.toLowerCase()) ? `The listing doesn’t specify ${requestedSpec} for ${product.name}. ` : '';
+    return `${caveat}${facts.join(' ')}`;
+  };
 
   try {
-    // 1. Refusal to place order via chat
-    if (/\b(?:buy|purchase)\b|\b(?:place|make|submit|want|like|need)\b.{0,25}\border\b|^\s*order\s+(?!status\b|details?\b|number\b|id\b|#)|\border\b.{0,20}\b(?:by|through|via)\s+(?:chat|assistant)\b/i.test(text)) {
-      return res.json({
-        reply: 'I can help you find products, but chat can’t place orders. Use the mic in the top bar to place orders.',
-        via: 'fallback',
-      });
-    }
+    if (!rawText) return respond('What would you like to find?', [searchLink]);
+    if (/^(hi|hello|hey|hiya|good morning|good afternoon|good evening|thanks|thank you)[!.\s]*$/i.test(text)) return respond('Hi! I can look up products and their listed details, find options by category, budget, rating or city, compare nearby stores, and help with your cart or orders. What are you looking for?', [searchLink, compareLink]);
+    if (/what can you do|how can you help|help me|site features|what is this (site|store)|what products (do you have|do you sell|are available)|what do you sell|show me the catalogue/i.test(text)) return respond('I can search the full product catalogue, explain a product’s listed price, description, stock and delivery details, compare nearby stores, and point you to your cart, wishlist or order history. I can’t place an order in chat.', [searchLink, compareLink, cartLink, ordersLink, link('Wishlist', '/wishlist')]);
+    if (/\b(?:place|make|submit)\s+(?:an?\s+)?order\b|\b(?:order|purchase|checkout)\b.{0,30}\b(?:through|via|in)\s+(?:chat|assistant)\b/i.test(text)) return respond('I can help you choose products, but chat can’t place orders. Add an item to your cart and complete checkout there.', [cartLink]);
 
-    // 2. Order tracking
-    if (/where.*order|track.*order|order.*status|delivery.*order/.test(text)) {
-      if (!lastOrderId) {
-        return res.json({
-          reply: 'I couldn’t find a recent order yet. Visit My Orders to see your order history.',
-          via: 'fallback',
-        });
-      }
+    if (/how (do i|can i|to) (search|find)|search (for|the) products|browse (products|categories)/i.test(text)) return respond('Use the search box at the top of the store, or browse Electronics, Fashion, Home, Books and Sports from the home page. You can narrow results by category, city, price and delivery options.', [searchLink, link('Home', '/')]);
+    if (/compare (stores|shops|prices)|nearby stores|store comparison|which store/i.test(text)) return respond('Open Compare stores to compare availability, price, delivery fee and estimated arrival for your selected location and basket. Estimates can vary by address and stock.', [compareLink]);
+    if (/where.*(cart|basket)|what.*(cart|basket)|view.*(cart|basket)|checkout/i.test(text)) return respond('Your cart is available from the Cart link in the store header. Review the basket there and continue to checkout to confirm your order.', [cartLink]);
+    if (/wishlist|saved products|save (a )?product/i.test(text)) return respond('Use the heart button on a product card or product page to save it, then open Wishlist from your account menu.', [link('Wishlist', '/wishlist'), link('Sign in', '/login')]);
+    if (/login|sign.?up|account|register/i.test(text)) return respond('Sign in to view your orders and saved items, or create an account if you’re new to Inventory Hub.', [link('Sign in', '/login'), link('Create account', '/signup')]);
+    if (/return|refund|warranty|payment method|cash on delivery|cod/i.test(text)) return respond('I can’t confirm a returns, refund, warranty or payment policy from the store information available to me, so I don’t want to guess. Please check the checkout details or contact the store team before placing an order.', [cartLink]);
+    if (/where.*order|track.*order|order.*status|delivery.*order|how (do i|can i|to) (track|check)/.test(text)) {
+      if (!lastOrderId) return respond('I couldn’t find a recent order yet. Open My orders to see your order history. If you share the order number, I can try to look it up here too.', [ordersLink, link('Sign in', '/login')]);
       const order = await fetchOrderById(pool, lastOrderId);
-      if (order) {
-        return res.json({
-          reply: `Order ${order.orderId} is currently ${order.status.toLowerCase()}. Open My Orders to follow its latest delivery updates.`,
-          via: 'fallback',
-        });
-      }
-      return res.json({
-        reply: `I found your recent order ${lastOrderId}. Open My Orders to see its latest delivery status.`,
-        via: 'fallback',
-      });
+      return respond(order ? `Your recent order ${order.orderId} is currently ${order.status.toLowerCase()}. Open My orders to follow its updates.` : `I found your recent order ${lastOrderId}. Open My orders to see its latest status.`, [ordersLink]);
     }
+    if (/delivery fee|delivery charge|shipping fee|how much.*deliver|delivery.*cost|how long.*deliver|delivery time|eta|arrive|delivery area/.test(text)) return respond(`Delivery options for ${cityContext} depend on the selected store, basket and address. Compare stores or review the estimate in your cart before checkout.`, [compareLink, cartLink]);
 
-    // 3. Expiry / Freshness
-    if (/fresh|expiry|expire|expired|milk/.test(text)) {
-      const { rows } = await pool.query(
-        `SELECT p.*, (i.stock_count - i.reserved_count) AS available_count 
-         FROM products p JOIN inventory i ON i.product_id = p.id 
-         WHERE p.sku = 'EXP-001' OR LOWER(p.name) LIKE '%milk%' LIMIT 1`
-      );
-      if (rows.length > 0) {
-        const milk = mapDbProductToContract(rows[0]);
-        const days = milk.days_to_expiry;
-        const reply = milk.expiry_status === 'near_expiry'
-          ? `${milk.name} is still within its date, but it expires in ${days} ${days === 1 ? 'day' : 'days'}. Check the date on the pack before use.`
-          : milk.expiry_status === 'fresh'
-          ? `${milk.name} is fresh, with ${days} days remaining before expiry.`
-          : 'I couldn’t confirm the expiry details for that item.';
-        return res.json({ reply, products: [milk], via: 'fallback' });
-      }
-    }
-
-    // 4. Delivery fee & ETA
-    if (/delivery fee|delivery charge|shipping fee|how much.*deliver|delivery.*cost|how long.*deliver|delivery time|eta|arrive/.test(text)) {
-      return res.json({
-        reply: `For ${cityContext}, standard delivery is ₹49 with an estimated delivery time of 25–35 minutes. Free delivery applies for orders over ₹499.`,
-        via: 'fallback',
-      });
-    }
-
-    // 5. Product search & recommendations
     const { rows: allRows } = await pool.query(
-      `SELECT p.*, (i.stock_count - i.reserved_count) AS available_count 
-       FROM products p JOIN inventory i ON i.product_id = p.id 
-       WHERE p.is_active = TRUE AND (i.stock_count - i.reserved_count) > 0`
+      `SELECT p.*, (i.stock_count - i.reserved_count) AS available_count
+       FROM products p JOIN inventory i ON i.product_id = p.id
+       WHERE p.is_active = TRUE`
     );
-    let all = allRows.map(mapDbProductToContract).filter((p) => p.expiry_status !== 'expired');
+    const all = allRows.map(mapDbProductToContract);
+    const cartProducts = cartProductIds.map((id) => all.find((product) => product.productId === id)).filter(Boolean);
+    const lastProduct = /^(what about|and|how about|its|their|more|price|availability|is it|does it|can it)\b/i.test(text) ? (Array.isArray(context?.lastProductIds) ? context.lastProductIds.map(Number).map((id: number) => all.find((product) => product.productId === id)).find(Boolean) : undefined) : undefined;
+    if (lastProduct && /price|cost|stock|availability|delivery|tell me|details|more|it\b|waterproof|battery|material|color|colour|size|dimensions|capacity|warranty|compatibility|weight|washable|ingredients?/.test(text)) return respond(productDetails(lastProduct, text), [link('View product', `/product/${lastProduct.productId}`)], [lastProduct]);
+    if (/\b(cart|basket)\b/.test(text)) return cartProducts.length ? respond(`Your cart has ${cartProducts.length} ${cartProducts.length === 1 ? 'product' : 'products'}: ${cartProducts.map((product: any) => product.name).join(', ')}. Open your cart to review quantities and totals.`, [cartLink], cartProducts) : respond('Your cart is empty right now. Browse the catalogue and add a product to get started.', [searchLink]);
+
+    if (/fresh|expiry|expire|expired/.test(text) && !termsFor(rawText).some((term: string) => !['fresh', 'expiry', 'expire', 'expired'].includes(term))) {
+      const product = all.find((item) => /milk/i.test(item.name) && item.expiry_status !== 'expired');
+      if (product) {
+        const days = product.days_to_expiry;
+        const reply = product.expiry_status === 'near_expiry' ? `${product.name} is still within its date, but it expires in ${days} ${days === 1 ? 'day' : 'days'}. Check the date on the pack before use.` : product.expiry_status === 'fresh' ? `${product.name} is fresh, with ${days} days remaining before expiry.` : 'I couldn’t confirm the expiry details for that item.';
+        return respond(reply, [link('View product', `/product/${product.productId}`)], [product]);
+      }
+    }
 
     const cityMatch = text.match(/\b(coimbatore|bengaluru|mumbai|delhi|chennai|hyderabad)\b/i)?.[0];
     const city = cityMatch?.toLowerCase();
-
     const priceMatch = text.match(/(?:under|below|less than|upto|up to)\s*(?:₹\s*)?(\d[\d,]*)|(?:₹\s*)?(\d[\d,]*)\s*(?:rupees|rs|inr)/i);
     const amount = Number((priceMatch?.[1] ?? priceMatch?.[2] ?? '').replaceAll(',', ''));
     const limit = Number.isFinite(amount) && amount > 0 ? amount * 100 : null;
-
-    const isFootwear = /footwear|shoes?|sandals?|chappal|slippers?/i.test(text);
-    const isEarphones = /earphones?|earbuds?|headphones?|airdopes/i.test(text);
+    const terms = termsFor(rawText);
+    const asksDetails = /\b(tell me about|details?|description|specs?|specifications|features|how much is|price of|available stock|availability|in stock|fresh|expiry|expire|expired|waterproof|water resistant|battery|material|color|colour|size|dimensions|capacity|warranty|compatibility|weight|washable|ingredients?)\b|\bwhat does\b|\bwhat is the\b/i.test(text);
+    const scoreProduct = (product: any) => {
+      const name = termsFor(product.name);
+      const fields = termsFor(`${product.category} ${product.city} ${product.description} ${(product.tags || []).join(' ')}`);
+      return terms.reduce((score: number, term: string) => score + (name.includes(term) ? 5 : fields.includes(term) ? 2 : 0), 0);
+    };
     const wantsRating = /better rating|highest rated|best rated|ratings?|rating/i.test(text);
+    const wantsCheapest = /cheapest|lowest price|least expensive/.test(text);
+    const scored = all.map((product: any) => ({ product, score: scoreProduct(product) })).filter(({ product, score }: any) => (score > 0 || (!terms.length && asksRecommendation)) && (asksDetails || (product.inStock && product.expiry_status !== 'expired')) && (!city || product.city.toLowerCase() === city) && (!limit || product.priceCents <= limit));
+    scored.sort((a: any, b: any) => wantsRating ? (b.product.rating ?? 0) - (a.product.rating ?? 0) || a.product.priceCents - b.product.priceCents : wantsCheapest ? a.product.priceCents - b.product.priceCents : b.score - a.score || (b.product.rating ?? 0) - (a.product.rating ?? 0));
+    const matches = scored.map((entry: any) => entry.product);
+    const asksRecommendation = /\b(recommend|suggest|best|top|cheapest|lowest|under|below|less than|upto|up to|show|find|looking for|available|in stock|rating|rated)\b/i.test(text);
+    const categoryRequested = ['electronics', 'fashion', 'home', 'books', 'sports'].some((category) => text.includes(category));
+    if (!matches.length && (asksDetails || asksRecommendation || categoryRequested || !!city || !!limit || terms.length)) return respond(`I couldn’t find a matching in-stock product${cityMatch ? ` in ${cityMatch}` : ''}${limit ? ` under ₹${limit / 100}` : ''}. Try a product name or browse the catalogue by category.`, [searchLink]);
+    if (!matches.length) return respond('I’m not sure which product or store question you mean. Ask me about a product name, price, stock, delivery estimate, or use the store links below.', [searchLink, compareLink, ordersLink]);
 
-    let matches = all;
-    if (isFootwear) {
-      matches = matches.filter((p) => /footwear|shoes?|sandals?|chappal|slippers?/i.test(`${p.name} ${p.category} ${(p.tags || []).join(' ')}`));
-    } else if (isEarphones) {
-      matches = matches.filter((p) => /earphones?|earbuds?|headphones?|airdopes/i.test(`${p.name} ${(p.tags || []).join(' ')}`));
-    } else if (!wantsRating) {
-      const terms = text
-        .replace(/\b(?:show|find|recommend|which|what|is|are|the|best|cheapest|top|rated|product|products|under|below|less than|upto|up to|rupees|rs|inr|₹|in|from|available|for me|please)\b/gi, ' ')
-        .trim()
-        .split(/\s+/)
-        .filter((t) => t.length > 2);
-      if (terms.length > 0) {
-        matches = matches.filter((p) => terms.some((t) => `${p.name} ${p.category} ${p.description} ${(p.tags || []).join(' ')}`.toLowerCase().includes(t)));
-      }
-    }
-
-    if (city) matches = matches.filter((p) => p.city.toLowerCase() === city);
-    if (limit) matches = matches.filter((p) => p.priceCents <= limit);
-
-    if (wantsRating) matches.sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0) || a.priceCents - b.priceCents);
-    else if (/cheapest|lowest price|least expensive/.test(text)) matches.sort((a, b) => a.priceCents - b.priceCents);
-    else if (isEarphones) matches.sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0) || a.priceCents - b.priceCents);
-
-    if (!matches.length) {
-      return res.json({
-        reply: `I couldn’t find an in-stock ${isFootwear ? 'footwear' : 'product'}${cityMatch ? ` in ${cityMatch}` : ''}${limit ? ` under ₹${limit / 100}` : ''} in the catalogue.`,
-        via: 'fallback',
-      });
-    }
-
+    const exact = matches.find((product: any) => termsFor(product.name).every((term: string) => terms.includes(term)));
+    const detail = exact ?? (asksDetails && scored[0]?.score >= 5 ? matches[0] : null);
+    if (detail && (asksDetails || exact)) return respond(productDetails(detail, text), [link('View product', `/product/${detail.productId}`)], [detail]);
     const topMatches = matches.slice(0, 4);
-    if (wantsRating) {
-      return res.json({
-        reply: `${topMatches[0].name} has the highest rating${topMatches[0].rating ? ` at ${topMatches[0].rating} out of 5` : ''} among these options.`,
-        products: topMatches,
-        via: 'fallback',
-      });
-    }
-    if (isFootwear && city === 'coimbatore') {
-      return res.json({
-        reply: `Here’s a footwear option listed in Coimbatore.`,
-        products: topMatches,
-        via: 'fallback',
-      });
-    }
-    if (limit) {
-      return res.json({
-        reply: `Here are matching in-stock picks priced under ₹${limit / 100}.`,
-        products: topMatches,
-        via: 'fallback',
-      });
-    }
-    if (/cheapest|lowest price|least expensive/.test(text)) {
-      return res.json({
-        reply: `The lowest-priced earphones option is ${topMatches[0].name} at ₹${topMatches[0].priceCents / 100}.`,
-        products: topMatches,
-        via: 'fallback',
-      });
-    }
-    if (isEarphones) {
-      return res.json({
-        reply: `These earphones are the best-rated options${limit ? ` under ₹${limit / 100}` : ''}.`,
-        products: topMatches,
-        via: 'fallback',
-      });
-    }
-
-    res.json({
-      reply: 'Here are a few matching products from the catalogue.',
-      products: topMatches,
-      via: 'fallback',
-    });
+    const reply = wantsRating ? `${topMatches[0].name} is the highest-rated match${topMatches[0].rating ? ` at ${topMatches[0].rating} out of 5` : ''}.` : wantsCheapest ? `${topMatches[0].name} is the lowest-priced match at ₹${topMatches[0].priceCents / 100}.` : limit ? `Here are in-stock matches under ₹${limit / 100}${cityMatch ? ` in ${cityMatch}` : ''}, ranked by relevance and rating.` : `Here are the closest in-stock matches${cityMatch ? ` in ${cityMatch}` : ''}, ranked by relevance and rating.`;
+    return respond(reply, [link('Browse all products', `/search${terms.length ? `?q=${encodeURIComponent(terms.join(' '))}` : ''}`)], topMatches);
   } catch (err: any) {
     logger.error({ err }, 'Chat handler failed');
     sendError(res, 500, 'INTERNAL_ERROR', 'The assistant request failed.');
   }
 });
+
 
 // Central 404 Handler
 app.use((req: Request, res: Response) => {

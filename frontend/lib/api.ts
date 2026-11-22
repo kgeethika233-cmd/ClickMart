@@ -196,8 +196,9 @@ export async function sendVoiceCommand(transcript: string, city: string | null =
 }
 
 export type ChatMessage = { role: 'user' | 'assistant'; content: string }
-export type ChatContext = { city: string; cartProductIds: number[]; lastOrderId: string | null }
-export type ChatResponse = { reply: string; products?: Product[]; via: 'qwen' | 'fallback' }
+export type ChatContext = { city: string; cartProductIds: number[]; lastOrderId: string | null; lastProductIds?: number[] }
+export type ChatAction = { label: string; href: string }
+export type ChatResponse = { reply: string; products?: Product[]; actions?: ChatAction[]; via: 'qwen' | 'fallback' }
 
 export async function sendChat(messages: ChatMessage[], context: ChatContext): Promise<ChatResponse> {
   const history = messages.slice(-20)
@@ -206,5 +207,5 @@ export async function sendChat(messages: ChatMessage[], context: ChatContext): P
   if (!response.ok) throw new ApiError(response.status, 'INTERNAL_ERROR', 'The assistant request failed.')
   const data = await response.json() as Partial<ChatResponse>
   if (typeof data.reply !== 'string' || (data.products !== undefined && !Array.isArray(data.products))) throw new ApiError(response.status, 'INTERNAL_ERROR', 'The assistant returned an invalid response.')
-  return { reply: data.reply, products: data.products, via: data.via === 'qwen' ? 'qwen' : 'fallback' }
+  return { reply: data.reply, products: data.products, actions: Array.isArray(data.actions) ? data.actions.filter((action): action is { label: string; href: string } => !!action && typeof action === 'object' && typeof action.label === 'string' && typeof action.href === 'string' && action.href.startsWith('/')) : undefined, via: data.via === 'qwen' ? 'qwen' : 'fallback' }
 }
